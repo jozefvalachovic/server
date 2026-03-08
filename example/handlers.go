@@ -346,11 +346,10 @@ func validateEmail(w http.ResponseWriter, r *http.Request) {
 
 	sanitized := request.SanitizeEmail(req.Email)
 	if err := request.ValidateEmail(sanitized); err != nil {
-		msg := err.Error()
 		response.APIErrorWriter(w, response.APIError[any]{
 			Code:    http.StatusUnprocessableEntity,
 			Message: "invalid email address",
-			Error:   new(msg),
+			Error:   new(err.Error()),
 		})
 		return
 	}
@@ -375,11 +374,10 @@ func cacheDemo(w http.ResponseWriter, r *http.Request) {
 		CleanupInterval: 2 * time.Second,
 	})
 	if err != nil {
-		msg := err.Error()
 		response.APIErrorWriter(w, response.APIError[any]{
 			Code:    http.StatusInternalServerError,
 			Message: "failed to create cache store",
-			Error:   new(msg),
+			Error:   new(err.Error()),
 		})
 		return
 	}
@@ -387,11 +385,10 @@ func cacheDemo(w http.ResponseWriter, r *http.Request) {
 
 	// Store and retrieve a value.
 	if err := s.Set("demo-key", "hello from cache", nil); err != nil {
-		msg := err.Error()
 		response.APIErrorWriter(w, response.APIError[any]{
 			Code:    http.StatusInternalServerError,
 			Message: "cache set failed",
-			Error:   new(msg),
+			Error:   new(err.Error()),
 		})
 		return
 	}

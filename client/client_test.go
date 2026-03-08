@@ -33,7 +33,7 @@ func TestGet_Success(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("want 200, got %d", resp.StatusCode)
 	}
@@ -63,7 +63,7 @@ func TestRetry_EventualSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("want 200, got %d", resp.StatusCode)
 	}
@@ -91,7 +91,7 @@ func TestCircuitBreaker_OpensAfterThreshold(t *testing.T) {
 	for range 2 {
 		resp, _ := c.Get(context.Background(), ts.URL)
 		if resp != nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 	}
 

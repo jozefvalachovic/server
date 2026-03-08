@@ -368,19 +368,6 @@ func trimFloat(f float64, prec int) string {
 	return s
 }
 
-func fmtCount(n int64) string {
-	switch {
-	case n >= 1_000_000_000:
-		return trimFloat(float64(n)/1_000_000_000, 2) + "B"
-	case n >= 1_000_000:
-		return trimFloat(float64(n)/1_000_000, 2) + "M"
-	case n >= 1_000:
-		return trimFloat(float64(n)/1_000, 2) + "K"
-	default:
-		return strconv.FormatInt(n, 10)
-	}
-}
-
 func fmtBytes(n int64) string {
 	switch {
 	case n >= 1<<30:
