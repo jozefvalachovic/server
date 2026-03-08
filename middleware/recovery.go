@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"runtime/debug"
 
 	"github.com/jozefvalachovic/server/response"
 
@@ -61,14 +60,17 @@ func Recovery(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rw := &responseWriterTracker{ResponseWriter: w}
 		defer func() {
-			if err := recover(); err != nil {
-				// Log the panic with full stack trace
-				logger.LogError("Panic recovered",
-					"error", fmt.Sprint(err),
+			if rec := recover(); rec != nil {
+				var panicErr error
+				if e, ok := rec.(error); ok {
+					panicErr = e
+				} else {
+					panicErr = fmt.Errorf("%v", rec)
+				}
+				logger.LogErrorWithStack(panicErr, "Panic recovered",
 					"method", r.Method,
 					"path", r.URL.Path,
 					"remoteAddr", r.RemoteAddr,
-					"stack", string(debug.Stack()),
 				)
 
 				// Only write an error response if headers have not been committed yet.

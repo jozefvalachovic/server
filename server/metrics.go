@@ -41,6 +41,7 @@ func StartMetricsServer(cfg *MetricsServerConfig) (*MetricsServer, error) {
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", cfg.Handler)
+	mux.Handle("/logger-metrics", logger.MetricsHandler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		if _, err := w.Write([]byte("ok")); err != nil {

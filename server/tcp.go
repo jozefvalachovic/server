@@ -80,12 +80,16 @@ type TCPServer struct {
 
 	handler func(conn net.Conn)
 	wg      sync.WaitGroup
+	log     logger.Logger
 }
 
 // NewTCPServer initializes a new TCPServer instance.
 // Environment variables TCP_HOST (IP literal, e.g. 0.0.0.0) and TCP_PORT must be set.
 // Returns an error if the environment configuration is invalid.
 func NewTCPServer(handler func(conn net.Conn), appName, appVersion string, cfg TCPServerConfig) (*TCPServer, error) {
+	initLogger()
+	log := logger.With("component", "tcp")
+
 	var (
 		host = os.Getenv("TCP_HOST")
 		port = os.Getenv("TCP_PORT")
@@ -103,7 +107,7 @@ func NewTCPServer(handler func(conn net.Conn), appName, appVersion string, cfg T
 		metricsConfig = cfg.MetricsServerConfig
 	}
 
-	logger.LogDebug("Starting application...",
+	log.LogDebug("Starting application...",
 		"App Name", appName,
 		"App Version", appVersion,
 		"Golang Version", runtime.Version(),
@@ -128,7 +132,7 @@ func NewTCPServer(handler func(conn net.Conn), appName, appVersion string, cfg T
 	}
 
 	maxConns := config.GetTCPMaxConns()
-	logger.LogInfo("TCP server configured", "maxConns", maxConns)
+	log.LogInfo("TCP server configured", "maxConns", maxConns)
 
 	rejectMsg := cfg.RejectMessage
 	if rejectMsg == "" {
@@ -152,6 +156,7 @@ func NewTCPServer(handler func(conn net.Conn), appName, appVersion string, cfg T
 		metricsConfig: metricsConfig,
 
 		handler: handler,
+		log:     log,
 	}, nil
 }
 
@@ -176,17 +181,17 @@ func (s *TCPServer) Start() error {
 	var err error
 	if s.tlsConfig != nil {
 		ln, err = tls.Listen("tcp", s.addr, s.tlsConfig)
-		logger.LogInfo("TLS enabled for TCP server")
+		s.log.LogInfo("TLS enabled for TCP server")
 	} else {
 		ln, err = net.Listen("tcp", s.addr)
 	}
 	if err != nil {
-		logger.LogError("Failed to start TCP listener", "error", err.Error())
+		s.log.LogError("Failed to start TCP listener", "error", err.Error())
 		return err
 	}
 	s.listener = ln
 
-	logger.LogInfo("TCP server listening", "address", s.addr)
+	s.log.LogInfo("TCP server listening", "address", s.addr)
 	// The accept loop runs in a background goroutine tracked by s.wg so that
 	// GracefulShutdown can wait for it to exit. The loop unblocks when
 	// GracefulShutdown closes s.listener, which causes Accept() to return a
@@ -195,7 +200,7 @@ func (s *TCPServer) Start() error {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				logger.LogError("Panic in accept loop", "panic", fmt.Sprint(r))
+				s.log.LogError("Panic in accept loop", "panic", fmt.Sprint(r))
 			}
 			s.wg.Done()
 		}()
@@ -206,7 +211,7 @@ func (s *TCPServer) Start() error {
 				case <-s.ctx.Done():
 					return // graceful shutdown
 				default:
-					logger.LogError("Accept error", "error", err.Error())
+					s.log.LogError("Accept error", "error", err.Error())
 					continue
 				}
 			}
@@ -242,14 +247,14 @@ func (s *TCPServer) Start() error {
 			default:
 				// Send error message before closing
 				if _, err := conn.Write([]byte(s.rejectMsg)); err != nil {
-					logger.LogWarn("Failed to write rejection message", "remote", conn.RemoteAddr().String(), "error", err.Error())
+					s.log.LogWarn("Failed to write rejection message", "remote", conn.RemoteAddr().String(), "error", err.Error())
 				}
-				logger.LogWarn("Too many concurrent connections, rejecting new connection",
+				s.log.LogWarn("Too many concurrent connections, rejecting new connection",
 					"remote", conn.RemoteAddr().String(),
 					"activeConns", s.activeConns.Load(),
 					"maxConns", cap(s.connSem))
 				if err := conn.Close(); err != nil {
-					logger.LogWarn("Error closing rejected connection", "remote", conn.RemoteAddr().String(), "error", err.Error())
+					s.log.LogWarn("Error closing rejected connection", "remote", conn.RemoteAddr().String(), "error", err.Error())
 				}
 			}
 		}
@@ -264,7 +269,7 @@ func (s *TCPServer) Start() error {
 func (s *TCPServer) handleWithDeadlines(conn *deadlineConn) {
 	defer func() {
 		if r := recover(); r != nil {
-			logger.LogError("Panic in connection handler", "remote", conn.RemoteAddr().String(), "panic", fmt.Sprint(r))
+			s.log.LogError("Panic in connection handler", "remote", conn.RemoteAddr().String(), "panic", fmt.Sprint(r))
 		}
 		_ = conn.Close()
 	}()
@@ -320,11 +325,11 @@ func (c *deadlineConn) Close() error {
 // The caller controls the deadline via ctx (typically context.WithTimeout).
 // Returns the first non-nil error encountered.
 func (s *TCPServer) GracefulShutdown(ctx context.Context) error {
-	logger.LogInfo("Starting graceful shutdown...")
+	s.log.LogInfo("Starting graceful shutdown...")
 	s.cancel()
 	if s.listener != nil {
 		if err := s.listener.Close(); err != nil {
-			logger.LogWarn("Error closing TCP listener during graceful shutdown", "error", err.Error())
+			s.log.LogWarn("Error closing TCP listener during graceful shutdown", "error", err.Error())
 		}
 	}
 
@@ -337,10 +342,10 @@ func (s *TCPServer) GracefulShutdown(ctx context.Context) error {
 	var shutdownErr error
 	select {
 	case <-done:
-		logger.LogInfo("All connections closed gracefully.")
+		s.log.LogInfo("All connections closed gracefully.")
 	case <-ctx.Done():
 		shutdownErr = ctx.Err()
-		logger.LogWarn("Shutdown deadline exceeded, some connections may be aborted.", "activeConns", s.activeConns.Load())
+		s.log.LogWarn("Shutdown deadline exceeded, some connections may be aborted.", "activeConns", s.activeConns.Load())
 	}
 
 	// Shutdown metrics server using a short independent deadline.
@@ -348,12 +353,18 @@ func (s *TCPServer) GracefulShutdown(ctx context.Context) error {
 		mCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := s.metricsServer.Shutdown(mCtx); err != nil {
-			logger.LogError("Metrics server shutdown error", "error", err.Error())
+			s.log.LogError("Metrics server shutdown error", "error", err.Error())
 			if shutdownErr == nil {
 				shutdownErr = err
 			}
 		}
 	}
+
+	// Drain logger buffers (async, dedup) before exiting.
+	logCtx, logCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer logCancel()
+	_ = logger.Shutdown(logCtx)
+
 	return shutdownErr
 }
 
@@ -365,11 +376,11 @@ func (s *TCPServer) GetActiveConnections() int64 {
 // ForceShutdown immediately stops the server without waiting for ongoing connections.
 // All active connections are closed immediately.
 func (s *TCPServer) ForceShutdown() {
-	logger.LogInfo("Forcefully closing TCP server...")
+	s.log.LogInfo("Forcefully closing TCP server...")
 	s.cancel()
 	if s.listener != nil {
 		if err := s.listener.Close(); err != nil {
-			logger.LogWarn("Error closing TCP listener during force shutdown", "error", err.Error())
+			s.log.LogWarn("Error closing TCP listener during force shutdown", "error", err.Error())
 		}
 	}
 
@@ -378,7 +389,7 @@ func (s *TCPServer) ForceShutdown() {
 		if dc, ok := key.(*deadlineConn); ok {
 			dc.forcedClose.Store(true)
 			if err := dc.Conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-				logger.LogWarn("Error closing connection during force shutdown", "remote", dc.RemoteAddr().String(), "error", err.Error())
+				s.log.LogWarn("Error closing connection during force shutdown", "remote", dc.RemoteAddr().String(), "error", err.Error())
 			}
 		}
 		return true
@@ -396,7 +407,7 @@ func (s *TCPServer) ForceShutdown() {
 	select {
 	case <-forceWaitDone:
 	case <-time.After(5 * time.Second):
-		logger.LogWarn("ForceShutdown: timed out waiting for handler goroutines", "activeConns", s.activeConns.Load())
+		s.log.LogWarn("ForceShutdown: timed out waiting for handler goroutines", "activeConns", s.activeConns.Load())
 	}
 
 	// Shutdown metrics server.
@@ -404,7 +415,12 @@ func (s *TCPServer) ForceShutdown() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := s.metricsServer.Shutdown(ctx); err != nil {
-			logger.LogError("Metrics server shutdown error during force shutdown", "error", err.Error())
+			s.log.LogError("Metrics server shutdown error during force shutdown", "error", err.Error())
 		}
 	}
+
+	// Drain logger buffers (async, dedup) before exiting.
+	logCtx, logCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer logCancel()
+	_ = logger.Shutdown(logCtx)
 }

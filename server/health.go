@@ -65,6 +65,15 @@ func NewHealthChecker(version string, checkTimeout time.Duration) *HealthChecker
 	}
 }
 
+// RegisterLoggerHealthCheck registers the logger subsystem as a health
+// dependency. The check verifies the output writer, async buffer usage,
+// and audit state.
+func (h *HealthChecker) RegisterLoggerHealthCheck() {
+	h.Register("logger", func(_ context.Context) error {
+		return logger.HealthCheck()
+	})
+}
+
 // Register adds or replaces a named dependency check.
 //
 //	hc.Register("postgres", func(ctx context.Context) error {

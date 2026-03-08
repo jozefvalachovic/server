@@ -79,6 +79,7 @@ func main() {
 	// restart cascades. ReadinessHandler (/readyz) runs all registered
 	// checks concurrently and returns 503 when any dependency is unhealthy.
 	hc := server.NewHealthChecker("1.0.0", 5*time.Second)
+	hc.RegisterLoggerHealthCheck()
 	hc.Register("cache", func(ctx context.Context) error {
 		_ = ctx
 		if store == nil {

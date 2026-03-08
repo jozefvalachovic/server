@@ -23,6 +23,17 @@ import (
 	loggerMiddleware "github.com/jozefvalachovic/logger/v4/middleware"
 )
 
+var initLoggerOnce sync.Once
+
+func initLogger() {
+	initLoggerOnce.Do(func() {
+		cfg := logger.ConfigFromEnv()
+		cfg.EnableDedup = true
+		cfg.EnableMetrics = true
+		logger.SetConfig(cfg)
+	})
+}
+
 type HTTPMiddleware func(http.Handler) http.Handler
 
 // Re-exports — callers only need to import "server", not "middleware".
@@ -202,6 +213,7 @@ type HTTPServer struct {
 	listener      net.Listener
 	metricsConfig *MetricsServerConfig
 	metricsServer *MetricsServer
+	log           logger.Logger
 }
 
 // limitedListener wraps a net.Listener and enforces a maximum number of
@@ -242,6 +254,9 @@ func (c *semConn) Close() error {
 // NewHTTPServer initializes a new HTTPServer.
 // Environment variables HTTP_HOST and HTTP_PORT must be set.
 func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServerConfig) (*HTTPServer, error) {
+	initLogger()
+	log := logger.With("component", "http")
+
 	port := os.Getenv("HTTP_PORT")
 	portNum, portErr := strconv.Atoi(port)
 	if portErr != nil || portNum < 1 || portNum > 65535 {
@@ -261,7 +276,7 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 		}
 	}
 
-	logger.LogDebug("Starting application...",
+	log.LogDebug("Starting application...",
 		"App Name", appName,
 		"App Version", appVersion,
 		"Golang Version", runtime.Version(),
@@ -386,6 +401,7 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 		maxConns:      cfg.MaxConns,
 		server:        srv,
 		metricsConfig: cfg.MetricsServerConfig,
+		log:           log,
 	}, nil
 }
 
@@ -417,7 +433,7 @@ func (as *HTTPServer) Start() error {
 	as.listener = ln
 
 	go func(ln net.Listener) {
-		logger.LogInfo("Server starting", "port", as.port)
+		as.log.LogInfo("Server starting", "port", as.port)
 		var serveErr error
 		if as.tlsConfig != nil {
 			serveErr = as.server.ServeTLS(ln, as.certFile, as.keyFile)
@@ -425,7 +441,7 @@ func (as *HTTPServer) Start() error {
 			serveErr = as.server.Serve(ln)
 		}
 		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-			logger.LogError("Server failed to start", "error", serveErr.Error())
+			as.log.LogError("Server failed to start", "error", serveErr.Error())
 		}
 	}(ln)
 
@@ -439,11 +455,11 @@ func (as *HTTPServer) GracefulShutdown(ctx context.Context) error {
 	if as == nil {
 		return nil
 	}
-	logger.LogWarn("Starting graceful shutdown...")
+	as.log.LogWarn("Starting graceful shutdown...")
 
 	var shutdownErr error
 	if err := as.server.Shutdown(ctx); err != nil {
-		logger.LogError("Server shutdown error", "error", err.Error())
+		as.log.LogError("Server shutdown error", "error", err.Error())
 		shutdownErr = err
 	}
 
@@ -453,14 +469,20 @@ func (as *HTTPServer) GracefulShutdown(ctx context.Context) error {
 		mCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := as.metricsServer.Shutdown(mCtx); err != nil {
-			logger.LogError("Metrics server shutdown error", "error", err.Error())
+			as.log.LogError("Metrics server shutdown error", "error", err.Error())
 			if shutdownErr == nil {
 				shutdownErr = err
 			}
 		}
 	}
 
-	logger.LogInfo("Server stopped gracefully")
+	as.log.LogInfo("Server stopped gracefully")
+
+	// Drain logger buffers (async, dedup) before exiting.
+	logCtx, logCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer logCancel()
+	_ = logger.Shutdown(logCtx)
+
 	return shutdownErr
 }
 
@@ -470,7 +492,7 @@ func (as *HTTPServer) ForceShutdown() {
 		return
 	}
 	if err := as.server.Close(); err != nil {
-		logger.LogError("Server forced to close", "error", err.Error())
+		as.log.LogError("Server forced to close", "error", err.Error())
 	}
 
 	// Shutdown metrics server
@@ -478,9 +500,14 @@ func (as *HTTPServer) ForceShutdown() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := as.metricsServer.Shutdown(ctx); err != nil {
-			logger.LogError("Metrics server shutdown error during force shutdown", "error", err.Error())
+			as.log.LogError("Metrics server shutdown error during force shutdown", "error", err.Error())
 		}
 	}
 
-	logger.LogInfo("Server closed forcefully")
+	as.log.LogInfo("Server closed forcefully")
+
+	// Drain logger buffers (async, dedup) before exiting.
+	logCtx, logCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer logCancel()
+	_ = logger.Shutdown(logCtx)
 }

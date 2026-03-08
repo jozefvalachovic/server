@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"runtime/debug"
 	"sync"
 	"time"
 
@@ -77,10 +76,14 @@ func Timeout(cfgs ...TimeoutConfig) func(http.Handler) http.Handler {
 				// not committed" pattern from the Recovery middleware.
 				defer func() {
 					if rec := recover(); rec != nil {
-						logger.LogError("Panic recovered inside Timeout handler goroutine",
-							"panic", fmt.Sprint(rec),
+						var panicErr error
+						if e, ok := rec.(error); ok {
+							panicErr = e
+						} else {
+							panicErr = fmt.Errorf("%v", rec)
+						}
+						logger.LogErrorWithStack(panicErr, "Panic recovered inside Timeout handler goroutine",
 							"path", r.URL.Path,
-							"stack", string(debug.Stack()),
 						)
 						if tw.timeout() {
 							response.APIErrorWriter(w, response.APIError[any]{
