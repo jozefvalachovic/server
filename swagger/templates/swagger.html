@@ -1,0 +1,138 @@
+{{define "fields"}}
+{{- range .}}
+<li class="sf">
+  <div class="frow">
+    <span class="fname">{{.Name}}</span>
+    <span class="ftype">{{.Type}}</span>
+    {{- if .Required}}
+    <span class="badge b-req">required</span>
+    {{- else}}
+    <span class="badge b-opt">optional</span>
+    {{- end}}
+  </div>
+  {{- if .Fields}}
+  <ul class="slist">{{template "fields" .Fields}}</ul>
+  {{- end}}
+</li>
+{{- end}}
+{{end -}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{.Title}} — API Docs</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>
+      {{.Title}}
+      <span class="ver">v{{.Version}}</span>
+    </h1>
+    {{- if .Description}}
+    <p>{{.Description}}</p>
+    {{- end}}
+  </header>
+
+  <div class="toolbar">
+    <div class="search-wrap">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+           stroke="currentColor" stroke-width="2" stroke-linecap="round"
+           stroke-linejoin="round" aria-hidden="true">
+        <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+      </svg>
+      <input id="filter" type="search"
+             placeholder="Filter by method, path or tag… ( / )" autocomplete="off">
+    </div>
+    <button id="btn-expand"   class="btn">Expand all</button>
+    <button id="btn-collapse" class="btn">Collapse all</button>
+  </div>
+
+  <p id="no-results">No endpoints match your filter.</p>
+
+  {{- range .Endpoints}}
+  <details
+    data-method="{{.Method}}"
+    data-path="{{.Path}}"
+    data-summary="{{.Summary}}"
+    data-tags="{{range .Tags}}{{.}} {{end}}">
+    <summary>
+      <span class="method m-{{.MethodLower}}">{{.Method}}</span>
+      <span class="path">{{.Path}}</span>
+      {{- if .Summary}}
+      <span class="separator">&#8212;</span>
+      <span class="ep-summary">{{.Summary}}</span>
+      {{- end}}
+      {{- if .Tags}}
+      <span class="tags">
+        {{- range .Tags}}<span class="tag">{{.}}</span>{{end}}
+      </span>
+      {{- end}}
+      <span class="chevron" aria-hidden="true">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+             stroke="currentColor" stroke-width="2.5"
+             stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="9 18 15 12 9 6"/>
+        </svg>
+      </span>
+    </summary>
+
+    <div class="body">
+      {{- if .Description}}
+      <p class="desc">{{.Description}}</p>
+      {{- end}}
+
+      {{- if .Request}}
+      <div class="sec">
+        <div class="sec-label">Request Body</div>
+        <ul class="slist root">{{template "fields" .Request}}</ul>
+      </div>
+      {{- end}}
+
+      <div class="sec">
+        <div class="sec-label">Response — APIResponse[T]</div>
+        <div class="envelope">
+          <div class="erow">
+            <span class="fname">code</span>
+            <span class="ftype">integer</span>
+            <span class="badge b-req">required</span>
+          </div>
+          <div class="erow">
+            <span class="fname">data</span>
+            <span class="ftype">object</span>
+            <span class="badge b-req">required</span>
+          </div>
+          {{- if .Response}}
+          <div class="data-block">
+            <ul class="slist root">{{template "fields" .Response}}</ul>
+          </div>
+          {{- end}}
+          <div class="erow">
+            <span class="fname">message</span>
+            <span class="ftype">string</span>
+            <span class="badge b-opt">optional</span>
+          </div>
+          <div class="erow">
+            <span class="fname">metadata</span>
+            <span class="ftype">object</span>
+            <span class="badge b-opt">optional</span>
+          </div>
+          <div class="erow">
+            <span class="fname">pagination</span>
+            <span class="ftype">object</span>
+            <span class="badge b-opt">optional</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </details>
+  {{- end}}
+
+</div>
+<script src="script.js" defer></script>
+</body>
+</html>

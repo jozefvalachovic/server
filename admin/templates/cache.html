@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cache — {{.AppName}}</title>
+<link rel="stylesheet" href="/admin/style.css">
+</head>
+<body>
+<div class="wrap-wide">
+
+  <header>
+    <h1>{{.AppName}} <span class="ver">{{.AppVersion}}</span></h1>
+    <p>Cache explorer — updated on page load &middot; <a href="" class="link-primary">refresh</a></p>
+  </header>
+
+  <nav class="admin-nav">
+    <a href="/metrics/">Metrics</a>
+    <a href="/cache/" class="active">Cache</a>
+    <a href="/cache/logout">Sign out</a>
+  </nav>
+
+  <!-- Stat cards -->
+  <div class="stat-grid">
+    <div class="stat-card">
+      <div class="label">Keys</div>
+      <div class="value">{{.Stats.Size}}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Hits</div>
+      <div class="value">{{.Stats.Hits}}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Misses</div>
+      <div class="value">{{.Stats.Misses}}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Hit Rate</div>
+      <div class="value value-md">{{.HitRate}}%</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Sets</div>
+      <div class="value">{{.Stats.Sets}}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Evictions</div>
+      <div class="value">{{.Stats.Evictions}}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Memory Used</div>
+      <div class="value value-sm">{{.BytesUsedFmt}}</div>
+      {{- if .MemPct}}
+      <div class="progress-wrap">
+        <div class="progress-bar {{.MemBarClass}}" data-pct="{{printf "%.1f" .MemPct}}"></div>
+      </div>
+      <div class="sub">{{printf "%.1f" .MemPct}}% of {{.MaxMemFmt}}</div>
+      {{- end}}
+    </div>
+  </div>
+
+  <!-- Data explorer -->
+  <div class="section-header">
+    <span class="section-title">Data explorer</span>
+    <div class="toolbar-actions">
+      <div class="search-wrap search-main">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+             stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        <input id="filter" type="search" placeholder="Filter keys… ( / )" autocomplete="off">
+      </div>
+      <button class="btn btn-danger btn-sm" id="btn-flush">Flush all</button>
+    </div>
+  </div>
+
+  <p id="no-results" class="no-results">
+    Cache is empty or no keys match your filter.
+  </p>
+
+  <table class="data-table" id="cache-table">
+    <thead>
+      <tr>
+        <th data-col="key">Key</th>
+        <th data-col="type">Type</th>
+        <th data-col="ttl">TTL Remaining</th>
+        <th data-col="bytes">Est. Bytes</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+    {{- range .Entries}}
+    <tr data-key="{{.Key}}">
+      <td class="mono mono-break">{{.Key}}</td>
+      <td class="mono">{{.Type}}</td>
+      <td class="mono {{if .Expiring}}row-warn{{end}}">{{.TTL}}</td>
+      <td>{{.Bytes}} B</td>
+      <td class="cell-right">
+        <button class="btn btn-danger btn-sm btn-delete" data-key="{{.Key}}">Delete</button>
+      </td>
+    </tr>
+    {{- end}}
+    </tbody>
+  </table>
+
+</div>
+
+<!-- Flush-all confirmation modal -->
+<div class="modal-overlay" id="flush-modal">
+  <div class="modal-box">
+    <h3>Flush all cache entries?</h3>
+    <p>This will remove every cached entry and cannot be undone.</p>
+    <div class="modal-actions">
+      <button class="btn btn-sm" id="flush-cancel">Cancel</button>
+      <button class="btn btn-danger btn-sm" id="flush-confirm">Flush all</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="/admin/script.js" defer></script>
+</body>
+</html>

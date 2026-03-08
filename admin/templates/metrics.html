@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Metrics — {{.AppName}}</title>
+<link rel="stylesheet" href="/admin/style.css">
+</head>
+<body>
+<div class="wrap-wide">
+
+  <header>
+    <h1>{{.AppName}} <span class="ver">{{.AppVersion}}</span></h1>
+    <p>Request metrics — updated on page load &middot; <a href="" class="link-primary">refresh</a></p>
+  </header>
+
+  <nav class="admin-nav">
+    <a href="/metrics/" class="active">Metrics</a>
+    <a href="/cache/">Cache</a>
+    <a href="/metrics/logout">Sign out</a>
+  </nav>
+
+  <!-- Summary stat cards -->
+  <div class="stat-grid">
+    <div class="stat-card">
+      <div class="label">Total Requests</div>
+      <div class="value">{{.TotalReqs}}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">5xx Errors</div>
+      <div class="value">{{.Total5xx}}</div>
+      {{- if .TotalReqs}}
+      <div class="sub">{{printf "%.2f" .ErrorPct}}%</div>
+      {{- end}}
+    </div>
+    <div class="stat-card">
+      <div class="label">Avg Latency</div>
+      <div class="value value-md">{{.AvgLatency}}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Routes</div>
+      <div class="value">{{.RouteCount}}</div>
+    </div>
+  </div>
+
+  <!-- Route table -->
+  <div class="section-header">
+    <span class="section-title">Per-route breakdown</span>
+    <div class="toolbar toolbar-inline">
+      <div class="search-wrap search-main">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+             stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        <input id="filter" type="search" placeholder="Filter routes… ( / )" autocomplete="off">
+      </div>
+    </div>
+  </div>
+
+  <p id="no-results" class="no-results">
+    No routes match your filter.
+  </p>
+
+  <table class="data-table" id="routes-table">
+    <thead>
+      <tr>
+        <th data-col="pattern">Pattern</th>
+        <th data-col="count">Requests</th>
+        <th data-col="errors">Errors (5xx)</th>
+        <th data-col="errorpct">Error %</th>
+        <th data-col="avg">Avg Latency</th>
+        <th data-col="min">Min</th>
+        <th data-col="max">Max</th>
+        <th data-col="bytes">Avg Bytes</th>
+      </tr>
+    </thead>
+    <tbody>
+    {{- range .Routes}}
+    <tr class="{{.RowClass}}"
+        data-pattern="{{.Pattern}}"
+        data-count="{{.Count}}"
+        data-errorpct="{{printf "%.4f" .ErrorPct}}">
+      <td class="mono">{{.Pattern}}</td>
+      <td>{{.Count}}</td>
+      <td>{{.Errors5xx}}</td>
+      <td>{{printf "%.2f" .ErrorPct}}%</td>
+      <td class="mono">{{.FmtAvgLatency}}</td>
+      <td class="mono">{{.FmtMinLatency}}</td>
+      <td class="mono">{{.FmtMaxLatency}}</td>
+      <td>{{printf "%.0f" .AvgBytes}} B</td>
+    </tr>
+    {{- end}}
+    </tbody>
+  </table>
+
+</div>
+<div class="toast" id="toast"></div>
+<script src="/admin/script.js" defer></script>
+</body>
+</html>
