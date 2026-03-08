@@ -54,13 +54,11 @@ func TestCacheStore_ConcurrentSetGetDelete(t *testing.T) {
 
 	// Concurrent GetStats calls.
 	for range goroutines / 5 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range keysPerGoroutine {
 				_ = cs.GetStats()
 			}
-		}()
+		})
 	}
 
 	wg.Wait()

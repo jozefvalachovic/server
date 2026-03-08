@@ -110,13 +110,11 @@ func TestHealthChecker_ConcurrentCheckAndRegister(t *testing.T) {
 
 	// Hammer Result() concurrently.
 	for range goroutines / 2 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range iterations {
 				_ = hc.Result(context.Background())
 			}
-		}()
+		})
 	}
 
 	// Simultaneously register/deregister checks.

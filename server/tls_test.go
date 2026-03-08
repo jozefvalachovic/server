@@ -168,9 +168,7 @@ func TestCertReloader_ConcurrentGetCertificate(t *testing.T) {
 
 	// Hammer GetCertificate while cert files are being replaced.
 	for range goroutines {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range iterations {
 				cert, err := r.GetCertificate(nil)
 				if err != nil {
@@ -180,7 +178,7 @@ func TestCertReloader_ConcurrentGetCertificate(t *testing.T) {
 					t.Error("GetCertificate returned nil")
 				}
 			}
-		}()
+		})
 	}
 
 	// Simultaneously replace the cert files a few times.

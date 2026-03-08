@@ -66,28 +66,24 @@ func TestTokenStore_ConcurrentRotateAndVerify(t *testing.T) {
 
 	// Concurrent verification.
 	for range goroutines / 2 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range iterations {
 				// Either token-a, token-b, token-c, or token-d may be valid
 				// depending on rotation timing — we just verify no panics/races.
 				_, _ = store.Verify(context.Background(), "token-a")
 				_, _ = store.Verify(context.Background(), "token-c")
 			}
-		}()
+		})
 	}
 
 	// Concurrent rotation.
 	for range goroutines / 2 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range iterations {
 				store.Rotate("token-c", "token-d")
 				store.Rotate("token-a", "token-b")
 			}
-		}()
+		})
 	}
 
 	wg.Wait()
