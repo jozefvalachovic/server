@@ -119,7 +119,7 @@ func TestBaseURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 func TestDefaultShouldRetry(t *testing.T) {
