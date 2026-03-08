@@ -96,9 +96,11 @@ func TestIntegration_SecurityHeaders(t *testing.T) {
 	_ = resp.Body.Close()
 
 	checks := map[string]string{
-		"X-Content-Type-Options": "nosniff",
-		"X-Frame-Options":        "DENY",
-		"Server":                 "server",
+		"X-Content-Type-Options":       "nosniff",
+		"X-Frame-Options":              "DENY",
+		"Cross-Origin-Opener-Policy":   "same-origin",
+		"Cross-Origin-Resource-Policy": "same-origin",
+		"Server":                       "server",
 	}
 	for header, expected := range checks {
 		if got := resp.Header.Get(header); got != expected {

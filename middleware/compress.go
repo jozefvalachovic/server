@@ -1,8 +1,11 @@
 package middleware
 
 import (
+	"bufio"
 	"compress/gzip"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -68,7 +71,14 @@ func (g *gzipResponseWriter) activate() {
 
 func (g *gzipResponseWriter) WriteHeader(code int) {
 	if !g.decided {
-		g.activate()
+		// Status codes 1xx, 204, and 304 never carry a body — skip compression
+		// entirely so gz.Close() does not attempt to write a gzip trailer.
+		if code == http.StatusNoContent || code == http.StatusNotModified || (code >= 100 && code < 200) {
+			g.decided = true
+			g.active = false
+		} else {
+			g.activate()
+		}
 	}
 	g.ResponseWriter.WriteHeader(code)
 }
@@ -90,6 +100,15 @@ func (g *gzipResponseWriter) Flush() {
 	if f, ok := g.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Hijack implements http.Hijacker so WebSocket upgrades work through the
+// compression layer. Compression is not applied to the hijacked connection.
+func (g *gzipResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := g.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("compress: underlying ResponseWriter does not implement http.Hijacker")
 }
 
 // Unwrap allows middleware that wraps ResponseWriter to introspect the chain.

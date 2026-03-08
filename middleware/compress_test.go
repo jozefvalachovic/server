@@ -122,3 +122,40 @@ func TestCompress_CustomContentType(t *testing.T) {
 		t.Fatalf("want gzip for text/csv, got %q", got)
 	}
 }
+
+func TestCompress_NoContent204_NoGzipTrailer(t *testing.T) {
+	mw := Compress(CompressConfig{Enabled: true})
+	req := httptest.NewRequest(http.MethodPost, "/flush", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	mw(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("want 204, got %d", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Encoding"); got == "gzip" {
+		t.Fatal("204 response must not have Content-Encoding: gzip")
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("204 response body must be empty, got %d bytes", rec.Body.Len())
+	}
+}
+
+func TestCompress_NotModified304_NoGzipTrailer(t *testing.T) {
+	mw := Compress(CompressConfig{Enabled: true})
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	mw(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotModified)
+	})).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotModified {
+		t.Fatalf("want 304, got %d", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Encoding"); got == "gzip" {
+		t.Fatal("304 response must not have Content-Encoding: gzip")
+	}
+}

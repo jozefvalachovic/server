@@ -209,9 +209,10 @@ func main() {
 
 	// ── MCP tool server at /mcp ───────────────────────────────────────────
 	routes.RegisterMCP(mux, "/mcp", mcp.Config{
-		Name:    "example-server",
-		Version: "1.0.0",
-		Tools:   mcpTools(),
+		Name:           "example-server",
+		Version:        "1.0.0",
+		Tools:          mcpTools(),
+		AllowedOrigins: []string{"http://localhost:3000", "https://example.com"},
 	})
 
 	// ── HTTP server ────────────────────────────────────────────────────────

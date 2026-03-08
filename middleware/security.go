@@ -17,6 +17,8 @@ var staticHeaders = [...]struct{ k, v string }{
 	{"Referrer-Policy", "strict-origin-when-cross-origin"},
 	{"Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'"},
 	{"Permissions-Policy", "geolocation=(), microphone=(), camera=()"},
+	{"Cross-Origin-Opener-Policy", "same-origin"},
+	{"Cross-Origin-Resource-Policy", "same-origin"},
 	{"Server", "server"},
 }
 

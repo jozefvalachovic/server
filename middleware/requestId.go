@@ -73,6 +73,10 @@ func RequestID(cfgs ...RequestIDConfig) func(http.Handler) http.Handler {
 			id := r.Header.Get(cfg.Header)
 			if id == "" {
 				id = cfg.Generator()
+			} else {
+				// Sanitize client-provided IDs: cap length and strip control
+				// characters to prevent log injection.
+				id = sanitizeRequestID(id)
 			}
 
 			// Propagate via context so handlers can access it without header parsing.
@@ -94,4 +98,26 @@ func defaultIDGenerator() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// sanitizeRequestID caps the length and removes control characters from
+// externally-provided request IDs to prevent log injection attacks.
+func sanitizeRequestID(id string) string {
+	const maxLen = 128
+	if len(id) > maxLen {
+		id = id[:maxLen]
+	}
+	for i := range len(id) {
+		if id[i] < 0x20 || id[i] == 0x7f {
+			// Contains control characters — rebuild without them.
+			var b []byte
+			for j := range len(id) {
+				if id[j] >= 0x20 && id[j] != 0x7f {
+					b = append(b, id[j])
+				}
+			}
+			return string(b)
+		}
+	}
+	return id
 }

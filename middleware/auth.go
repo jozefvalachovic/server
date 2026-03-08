@@ -153,11 +153,10 @@ func extractCredential(r *http.Request, scheme AuthScheme, apiKeyHeader string) 
 		key := r.Header.Get(apiKeyHeader)
 		return key, key != ""
 	default: // Bearer
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
+		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !ok {
 			return "", false
 		}
-		token := strings.TrimPrefix(auth, "Bearer ")
 		return token, token != ""
 	}
 }
