@@ -113,6 +113,8 @@ func utilRegistrar(mux *http.ServeMux) {
 			// Replace with real JWT parsing / DB lookup in production.
 			return "user:" + token, nil
 		},
+		// Emit structured audit events on every failed auth attempt.
+		OnAuthFailure: middleware.AuditAuthFailure,
 	}
 	protectedMe := middleware.Auth(authCfg)(http.HandlerFunc(getMe))
 

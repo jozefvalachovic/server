@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -23,13 +24,37 @@ import (
 	loggerMiddleware "github.com/jozefvalachovic/logger/v4/middleware"
 )
 
+// OTelBridgeConfig enables the logger OTel bridge handler so that log records
+// are enriched with service metadata and level-mapped for OTel-compatible
+// collectors (e.g. Grafana Alloy, OpenTelemetry Collector).
+//
+// When set on HTTPServerConfig or TCPServerConfig, the bridge is registered as
+// an additional slog handler during logger initialisation.
+type OTelBridgeConfig struct {
+	// ServiceName identifies the service in OTel attributes (service.name).
+	ServiceName string
+	// ServiceVersion is emitted as service.version.
+	ServiceVersion string
+	// Handler is the inner slog.Handler that receives OTel-mapped records.
+	// Default when nil: slog.NewJSONHandler(os.Stderr, {Level: LevelDebug}).
+	Handler slog.Handler
+}
+
 var initLoggerOnce sync.Once
 
-func initLogger() {
+func initLogger(otel *OTelBridgeConfig) {
 	initLoggerOnce.Do(func() {
 		cfg := logger.ConfigFromEnv()
 		cfg.EnableDedup = true
 		cfg.EnableMetrics = true
+		if otel != nil {
+			inner := otel.Handler
+			if inner == nil {
+				inner = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
+			}
+			bridge := logger.NewOTelBridgeHandler(inner, otel.ServiceName, otel.ServiceVersion)
+			cfg.AdditionalHandlers = append(cfg.AdditionalHandlers, bridge)
+		}
 		logger.SetConfig(cfg)
 	})
 }
@@ -61,6 +86,9 @@ type AuthConfig = middleware.AuthConfig
 
 // RequestSizeConfig is a re-export of middleware.RequestSizeConfig.
 type RequestSizeConfig = middleware.RequestSizeConfig
+
+// TraceContextConfig is a re-export of middleware.TraceContextConfig.
+type TraceContextConfig = middleware.TraceContextConfig
 
 // Client is a re-export of client.Client — a resilient HTTP client with
 // circuit breaker and retry support. Callers only need to import "server".
@@ -109,6 +137,16 @@ type HTTPServerConfig struct {
 	// Default: nil (plain HTTP).
 	TLSConfig *tls.Config
 
+	// AutoCertReload enables automatic certificate rotation without restart.
+	// When true (and TLSConfig is set), the server polls the cert/key files
+	// for changes and hot-swaps the TLS certificate via GetCertificate.
+	// Default: false.
+	AutoCertReload bool
+
+	// CertReloadInterval is the polling interval for certificate file changes.
+	// Only used when AutoCertReload is true. Default: 30s.
+	CertReloadInterval time.Duration
+
 	// ReadTimeout is the maximum duration for reading the entire request,
 	// including the body. Default: config.DefaultReadTimeout (30 s).
 	// Set explicitly to override.
@@ -129,6 +167,12 @@ type HTTPServerConfig struct {
 	// nil disables audit logging.
 	AuditConfig *HTTPAuditConfig
 
+	// OTelBridge enables the OpenTelemetry log bridge.
+	// When set, logger output is duplicated to an OTel-compatible slog handler
+	// with service.name, service.version attributes and severity level mapping.
+	// nil disables the bridge.
+	OTelBridge *OTelBridgeConfig
+
 	// --- Built-in middleware ---
 	// Applied in the order listed; all are optional.
 
@@ -143,6 +187,10 @@ type HTTPServerConfig struct {
 	// RequestID configures request-ID injection/propagation.
 	// nil enables with defaults (X-Request-ID header, random hex ID).
 	RequestID *RequestIDConfig
+
+	// TraceContext configures W3C Trace Context (traceparent/tracestate)
+	// propagation. nil enables with defaults; set Disabled: true to turn off.
+	TraceContext *TraceContextConfig
 
 	// Timeout configures per-request handler timeouts.
 	// nil enables 30 s default. Set Timeout.Timeout = 0 to disable.
@@ -213,6 +261,7 @@ type HTTPServer struct {
 	listener      net.Listener
 	metricsConfig *MetricsServerConfig
 	metricsServer *MetricsServer
+	certReloader  *CertReloader
 	log           logger.Logger
 }
 
@@ -254,7 +303,7 @@ func (c *semConn) Close() error {
 // NewHTTPServer initializes a new HTTPServer.
 // Environment variables HTTP_HOST and HTTP_PORT must be set.
 func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServerConfig) (*HTTPServer, error) {
-	initLogger()
+	initLogger(cfg.OTelBridge)
 	log := logger.With("component", "http")
 
 	port := os.Getenv("HTTP_PORT")
@@ -268,11 +317,19 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 	}
 
 	var certFile, keyFile string
+	var certReloader *CertReloader
 	if cfg.TLSConfig != nil {
 		certFile = os.Getenv("HTTP_TLS_CERT_PATH")
 		keyFile = os.Getenv("HTTP_TLS_KEY_PATH")
 		if certFile == "" || keyFile == "" {
 			return nil, errors.New("TLS enabled but HTTP_TLS_CERT_PATH or HTTP_TLS_KEY_PATH not set")
+		}
+		if cfg.AutoCertReload {
+			var err error
+			_, _, certReloader, err = setupCertReloader(cfg.TLSConfig, "HTTP_TLS_CERT_PATH", "HTTP_TLS_KEY_PATH", cfg.CertReloadInterval)
+			if err != nil {
+				return nil, fmt.Errorf("auto cert reload: %w", err)
+			}
 		}
 	}
 
@@ -320,6 +377,11 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 	} else {
 		stack = append(stack, middleware.RequestID()) // defaults
 	}
+	if cfg.TraceContext != nil {
+		stack = append(stack, middleware.TraceContext(*cfg.TraceContext))
+	} else {
+		stack = append(stack, middleware.TraceContext()) // defaults
+	}
 	switch {
 	case cfg.Timeout == nil:
 		stack = append(stack, middleware.Timeout()) // 30 s default
@@ -344,7 +406,26 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 	// Logging is always the true outermost layer.
 	logOpts := []loggerMiddleware.HTTPMiddlewareOption{
 		loggerMiddleware.WithLogBodyOnErrors(true),
+		loggerMiddleware.WithRequestID(true),
+		loggerMiddleware.WithMetrics(true),
 	}
+
+	// Inject app identity into every access log entry when known.
+	if appName != "" || appVersion != "" {
+		fields := make(map[string]any, 2)
+		if appName != "" {
+			fields["app"] = appName
+		}
+		if appVersion != "" {
+			fields["version"] = appVersion
+		}
+		logOpts = append(logOpts, loggerMiddleware.WithCustomFields(fields))
+	}
+
+	// Always suppress noisy health-probe paths from access logs.
+	// User-provided SkipPaths from AuditConfig are merged in.
+	skipPaths := []string{"/healthz", "/readyz"}
+
 	if cfg.AuditConfig != nil {
 		if cfg.AuditConfig.Enabled {
 			logOpts = append(logOpts, loggerMiddleware.WithAudit(true))
@@ -352,10 +433,10 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 				logOpts = append(logOpts, loggerMiddleware.WithAuditMethods(cfg.AuditConfig.Methods...))
 			}
 		}
-		if len(cfg.AuditConfig.SkipPaths) > 0 {
-			logOpts = append(logOpts, loggerMiddleware.WithSkipPaths(cfg.AuditConfig.SkipPaths...))
-		}
+		skipPaths = append(skipPaths, cfg.AuditConfig.SkipPaths...)
 	}
+	logOpts = append(logOpts, loggerMiddleware.WithSkipPaths(skipPaths...))
+
 	handler = loggerMiddleware.LogHTTPMiddleware(handler, logOpts...)
 
 	// Apply safe defaults when the caller omits read/write timeouts.
@@ -401,6 +482,7 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 		maxConns:      cfg.MaxConns,
 		server:        srv,
 		metricsConfig: cfg.MetricsServerConfig,
+		certReloader:  certReloader,
 		log:           log,
 	}, nil
 }
@@ -476,6 +558,11 @@ func (as *HTTPServer) GracefulShutdown(ctx context.Context) error {
 		}
 	}
 
+	// Stop the certificate reloader (if active) before draining the logger.
+	if as.certReloader != nil {
+		as.certReloader.Stop()
+	}
+
 	as.log.LogInfo("Server stopped gracefully")
 
 	// Drain logger buffers (async, dedup) before exiting.
@@ -502,6 +589,10 @@ func (as *HTTPServer) ForceShutdown() {
 		if err := as.metricsServer.Shutdown(ctx); err != nil {
 			as.log.LogError("Metrics server shutdown error during force shutdown", "error", err.Error())
 		}
+	}
+
+	if as.certReloader != nil {
+		as.certReloader.Stop()
 	}
 
 	as.log.LogInfo("Server closed forcefully")

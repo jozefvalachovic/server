@@ -223,58 +223,74 @@ func main() {
 		AppVersion: "1.0.0",
 		Store:      store,
 	}
-	srv, err := server.NewHTTPServer(
-		mux, "example-server", "1.0.0",
-		server.HTTPServerConfig{
-			ReadTimeout:  5 * time.Second,
-			WriteTimeout: 30 * time.Second,
+	httpCfg := server.HTTPServerConfig{
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 30 * time.Second,
 
-			// CORS: allow the local dev front-end and production origin.
-			// Remove or set Disabled:true for fully public / same-origin APIs.
-			CORS: &server.CORSConfig{
-				AllowedOrigins:   []string{"http://localhost:3000", "https://example.com"},
-				AllowedHeaders:   []string{"Content-Type", "Authorization", "X-Request-ID", "X-API-Key"},
-				AllowCredentials: true,
-			},
+		// TLS with auto cert rotation (uncomment to enable):
+		// TLSConfig:          server.DefaultTLSConfig(),
+		// AutoCertReload:     true,                // polls cert/key files for changes
+		// CertReloadInterval: 30 * time.Second,    // default; set 0 for 30s
 
-			// RequestID: default config — X-Request-ID header, 16-byte random hex.
-			RequestID: &server.RequestIDConfig{},
-
-			// Timeout: 30 s per-handler deadline (writes 504 on breach).
-			Timeout: &server.TimeoutConfig{Timeout: 30 * time.Second},
-
-			// Compress: gzip for JSON / text responses when client accepts it.
-			Compress: &server.CompressConfig{Enabled: true},
-
-			// RateLimit: 50 req/s sustained, burst of 100 per client IP.
-			RateLimitConfig: &server.HTTPRateLimitConfig{
-				RequestsPerSecond: 50,
-				Burst:             100,
-			},
-
-			// AuditConfig: emit structured audit log for every state-changing
-			// request; suppress noisy health probe paths.
-			AuditConfig: &server.HTTPAuditConfig{
-				Enabled:   true,
-				Methods:   []string{"POST", "PUT", "PATCH", "DELETE"},
-				SkipPaths: []string{"/healthz", "/readyz", "/.well-known/appspecific/com.chrome.devtools.json"},
-			},
-
-			// Admin: metrics + cache UI protected by ADMIN_NAME / ADMIN_SECRET.
-			// Routes are registered automatically; set both env vars to enable.
-			Admin: adminCfg,
-
-			// Middlewares: extra app-level middleware applied after the built-in
-			// stack. Auth is shown here as a per-route wrapper in utilRegistrar
-			// instead of globally so public endpoints remain open.
-			Middlewares: []server.HTTPMiddleware{
-				middleware.IPFilter(middleware.IPFilterConfig{
-					// Example: uncomment to restrict to loopback + RFC-1918.
-					// Allowlist: []string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
-				}),
-			},
+		// OTelBridge: duplicate log output to an OTel-compatible JSON handler
+		// on stderr so a sidecar collector (e.g. Alloy, OTel Collector) can
+		// ingest structured logs with service.name/version and severity mapping.
+		// Remove or set nil when no collector is deployed.
+		OTelBridge: &server.OTelBridgeConfig{
+			ServiceName:    "example-server",
+			ServiceVersion: "1.0.0",
 		},
-	)
+
+		// CORS: allow the local dev front-end and production origin.
+		// Remove or set Disabled:true for fully public / same-origin APIs.
+		CORS: &server.CORSConfig{
+			AllowedOrigins:   []string{"http://localhost:3000", "https://example.com"},
+			AllowedHeaders:   []string{"Content-Type", "Authorization", "X-Request-ID", "X-API-Key"},
+			AllowCredentials: true,
+		},
+
+		// RequestID: default config — X-Request-ID header, 16-byte random hex.
+		RequestID: &server.RequestIDConfig{},
+
+		// Timeout: 30 s per-handler deadline (writes 504 on breach).
+		Timeout: &server.TimeoutConfig{Timeout: 30 * time.Second},
+
+		// Compress: gzip for JSON / text responses when client accepts it.
+		Compress: &server.CompressConfig{Enabled: true},
+
+		// RateLimit: 50 req/s sustained, burst of 100 per client IP.
+		RateLimitConfig: &server.HTTPRateLimitConfig{
+			RequestsPerSecond: 50,
+			Burst:             100,
+		},
+
+		// AuditConfig: emit structured audit log for every state-changing
+		// request. Health probe paths (/healthz, /readyz) are always
+		// skipped by the server; add app-specific paths here.
+		AuditConfig: &server.HTTPAuditConfig{
+			Enabled:   true,
+			Methods:   []string{"POST", "PUT", "PATCH", "DELETE"},
+			SkipPaths: []string{"/.well-known/appspecific/com.chrome.devtools.json"},
+		},
+
+		// Admin: metrics + cache UI protected by ADMIN_NAME / ADMIN_SECRET.
+		// Routes are registered automatically; set both env vars to enable.
+		Admin: adminCfg,
+
+		// Middlewares: extra app-level middleware applied after the built-in
+		// stack. Auth is shown here as a per-route wrapper in utilRegistrar
+		// instead of globally so public endpoints remain open.
+		Middlewares: []server.HTTPMiddleware{
+			middleware.IPFilter(middleware.IPFilterConfig{
+				// Example: uncomment to restrict to loopback + RFC-1918.
+				// Allowlist: []string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
+			}),
+		},
+	}
+	if err := httpCfg.Validate(); err != nil {
+		log.Fatalf("invalid HTTP server config: %v", err)
+	}
+	srv, err := server.NewHTTPServer(mux, "example-server", "1.0.0", httpCfg)
 	if err != nil {
 		log.Fatalf("http server: %v", err)
 	}

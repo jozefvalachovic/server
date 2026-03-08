@@ -34,6 +34,17 @@ type TCPServerConfig struct {
 	// Default: nil (plain TCP).
 	TLSConfig *tls.Config
 
+	// AutoCertReload enables automatic certificate rotation without restart.
+	// When true (and TLSConfig is set), the server polls the cert/key files
+	// for changes and hot-swaps the TLS certificate via GetCertificate.
+	// Reads TCP_TLS_CERT_PATH and TCP_TLS_KEY_PATH from the environment.
+	// Default: false.
+	AutoCertReload bool
+
+	// CertReloadInterval is the polling interval for certificate file changes.
+	// Only used when AutoCertReload is true. Default: 30s.
+	CertReloadInterval time.Duration
+
 	// RateLimitConfig enables per-IP connection rate limiting.
 	// nil disables rate limiting.
 	RateLimitConfig *TCPRateLimitConfig
@@ -41,6 +52,11 @@ type TCPServerConfig struct {
 	// MetricsServerConfig starts an embedded metrics server (e.g. Prometheus).
 	// nil disables the metrics server.
 	MetricsServerConfig *MetricsServerConfig
+
+	// OTelBridge enables the OpenTelemetry log bridge (same as HTTPServerConfig).
+	// Whichever server is constructed first wins (logger init is once-only).
+	// nil disables the bridge.
+	OTelBridge *OTelBridgeConfig
 
 	// ReadTimeout overrides the per-operation read deadline.
 	// Default: config.TCPReadTimeout.
@@ -74,6 +90,7 @@ type TCPServer struct {
 	activeConns   atomic.Int64 // Track active connections for metrics
 	metricsConfig *MetricsServerConfig
 	metricsServer *MetricsServer
+	certReloader  *CertReloader
 
 	appReadTimeout  time.Duration
 	appWriteTimeout time.Duration
@@ -87,7 +104,7 @@ type TCPServer struct {
 // Environment variables TCP_HOST (IP literal, e.g. 0.0.0.0) and TCP_PORT must be set.
 // Returns an error if the environment configuration is invalid.
 func NewTCPServer(handler func(conn net.Conn), appName, appVersion string, cfg TCPServerConfig) (*TCPServer, error) {
-	initLogger()
+	initLogger(cfg.OTelBridge)
 	log := logger.With("component", "tcp")
 
 	var (
@@ -112,6 +129,16 @@ func NewTCPServer(handler func(conn net.Conn), appName, appVersion string, cfg T
 		"App Version", appVersion,
 		"Golang Version", runtime.Version(),
 	)
+
+	// Auto cert reload — watch cert/key files and hot-swap via GetCertificate.
+	var certReloader *CertReloader
+	if cfg.TLSConfig != nil && cfg.AutoCertReload {
+		var err error
+		_, _, certReloader, err = setupCertReloader(cfg.TLSConfig, "TCP_TLS_CERT_PATH", "TCP_TLS_KEY_PATH", cfg.CertReloadInterval)
+		if err != nil {
+			return nil, fmt.Errorf("auto cert reload: %w", err)
+		}
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -154,6 +181,7 @@ func NewTCPServer(handler func(conn net.Conn), appName, appVersion string, cfg T
 		cancel:        cancel,
 		connSem:       make(chan struct{}, maxConns),
 		metricsConfig: metricsConfig,
+		certReloader:  certReloader,
 
 		handler: handler,
 		log:     log,
@@ -360,6 +388,11 @@ func (s *TCPServer) GracefulShutdown(ctx context.Context) error {
 		}
 	}
 
+	// Stop the certificate reloader (if active) before draining the logger.
+	if s.certReloader != nil {
+		s.certReloader.Stop()
+	}
+
 	// Drain logger buffers (async, dedup) before exiting.
 	logCtx, logCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer logCancel()
@@ -417,6 +450,10 @@ func (s *TCPServer) ForceShutdown() {
 		if err := s.metricsServer.Shutdown(ctx); err != nil {
 			s.log.LogError("Metrics server shutdown error during force shutdown", "error", err.Error())
 		}
+	}
+
+	if s.certReloader != nil {
+		s.certReloader.Stop()
 	}
 
 	// Drain logger buffers (async, dedup) before exiting.

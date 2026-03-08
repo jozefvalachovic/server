@@ -1,5 +1,8 @@
 # server
 
+[![CI](https://github.com/jozefvalachovic/server/actions/workflows/ci.yml/badge.svg)](https://github.com/jozefvalachovic/server/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/jozefvalachovic/server/graph/badge.svg)](https://codecov.io/gh/jozefvalachovic/server)
+
 Reusable building blocks for Go HTTP and TCP servers. One dependency (`logger/v4`), Go 1.26+.
 
 ```
@@ -134,6 +137,7 @@ server.CompressConfig{...}                          // re-exported from middlewa
 server.TimeoutConfig{...}                           // re-exported from middleware
 server.RequestIDConfig{...}                         // re-exported from middleware
 server.RequestSizeConfig{...}                       // re-exported from middleware
+server.TraceContextConfig{...}                      // re-exported from middleware
 server.ClientConfig{...}                            // re-exported from client
 server.ClientRetryConfig{...}                       // re-exported from client
 server.ClientCircuitBreakerConfig{...}              // re-exported from client
@@ -154,11 +158,13 @@ srv, err := server.NewHTTPServer(mux, "app", "1.0.0", server.HTTPServerConfig{
     MaxConns:     10_000,
     MaxHeaderBytes: 1 << 20,        // 1 MiB (default)
     TLSConfig:    tlsCfg,           // reads HTTP_TLS_CERT_PATH / HTTP_TLS_KEY_PATH
+    AutoCertReload: true,           // hot-swap certs without restart
     CORS:         &server.CORSConfig{AllowedOrigins: []string{"https://example.com"}},
     RateLimitConfig: &server.HTTPRateLimitConfig{RequestsPerSecond: 100, Burst: 200},
     Compress:     &server.CompressConfig{Enabled: true},
     Admin:        &server.AdminConfig{AppName: "app", AppVersion: "1.0.0", Store: store},
     AuditConfig:  &server.HTTPAuditConfig{Enabled: true, Methods: []string{"POST", "PUT", "DELETE"}},
+    OTelBridge:   &server.OTelBridgeConfig{ServiceName: "app", ServiceVersion: "1.0.0"},
     MetricsServerConfig: &server.MetricsServerConfig{Handler: promHandler},
     BaseContext:  func(net.Listener) context.Context { return baseCtx },
     ConnContext:  func(ctx context.Context, c net.Conn) context.Context { return ctx },
@@ -171,15 +177,19 @@ srv, err := server.NewHTTPServer(mux, "app", "1.0.0", server.HTTPServerConfig{
 | Field                 | Type                                              | Default                | Description                                                            |
 | --------------------- | ------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------- |
 | `TLSConfig`           | `*tls.Config`                                     | nil (plain HTTP)       | TLS configuration; requires `HTTP_TLS_CERT_PATH` / `HTTP_TLS_KEY_PATH` |
+| `AutoCertReload`      | `bool`                                            | false                  | Poll cert/key files and hot-swap without restart                       |
+| `CertReloadInterval`  | `time.Duration`                                   | 30 s                   | Polling interval for cert file changes                                 |
 | `ReadTimeout`         | `time.Duration`                                   | 30 s                   | Max duration for reading the entire request                            |
 | `WriteTimeout`        | `time.Duration`                                   | 60 s                   | Max duration for writing the response                                  |
 | `MaxConns`            | `int`                                             | 0 (unlimited)          | Max concurrent HTTP connections via listener semaphore                 |
 | `MaxHeaderBytes`      | `int`                                             | 1 MiB                  | Max size of request headers                                            |
 | `MetricsServerConfig` | `*MetricsServerConfig`                            | nil                    | Embedded metrics sidecar (e.g. Prometheus)                             |
 | `AuditConfig`         | `*HTTPAuditConfig`                                | nil                    | Structured audit logging per request                                   |
+| `OTelBridge`          | `*OTelBridgeConfig`                               | nil                    | OpenTelemetry log bridge (service.name + level mapping)                |
 | `RateLimitConfig`     | `*HTTPRateLimitConfig`                            | nil                    | Per-client token-bucket rate limiting                                  |
 | `CORS`                | `*CORSConfig`                                     | nil (disabled)         | Cross-Origin Resource Sharing headers                                  |
 | `RequestID`           | `*RequestIDConfig`                                | defaults enabled       | Request-ID injection/propagation                                       |
+| `TraceContext`        | `*TraceContextConfig`                             | defaults enabled       | W3C traceparent / tracestate propagation                               |
 | `Timeout`             | `*TimeoutConfig`                                  | 30 s default           | Per-request handler timeout; set `Timeout: 0` to disable               |
 | `IPFilter`            | `*IPFilterConfig`                                 | nil (allow all)        | IP allowlist/blocklist enforcement                                     |
 | `Compress`            | `*CompressConfig`                                 | nil (disabled)         | gzip response compression (must set `Enabled: true`)                   |
@@ -296,21 +306,33 @@ All middleware follow the `func(http.Handler) http.Handler` pattern and can be a
 
 `NewHTTPServer` assembles a fixed middleware stack. Built-in middleware always executes in this order (outermost first):
 
-```
-1.  Logger            — access logging + optional audit (always on)
-2.  Recovery          — panic → 500 + stack trace
-3.  Security          — security headers (CSP, HSTS, X-Frame-Options, …)
-4.  IPFilter          — CIDR allowlist / blocklist
-5.  RequestSize       — body size limit (10 MiB default)
-6.  RateLimit         — token-bucket per-client rate limiting
-7.  CORS              — Cross-Origin Resource Sharing headers
-8.  RequestID         — X-Request-ID injection
-9.  Timeout           — per-request context deadline
-10. Compress          — gzip response encoding
-11. Admin Collector   — per-route metrics capture
-12. User Middlewares  — HTTPServerConfig.Middlewares (in slice order)
-    ↓
-    Handler (mux)
+```mermaid
+flowchart TD
+    A["1. Logger — access logging + optional audit"] --> B["2. Recovery — panic → 500 + stack trace"]
+    B --> C["3. Security — CSP, HSTS, X-Frame-Options, …"]
+    C --> D{"IPFilter configured?"}
+    D -- yes --> E["4. IPFilter — CIDR allowlist / blocklist"]
+    D -- no --> F["5. RequestSize — body size limit"]
+    E --> F
+    F --> G{"RateLimit configured?"}
+    G -- yes --> H["6. RateLimit — token-bucket per-client"]
+    G -- no --> I{"CORS configured?"}
+    H --> I
+    I -- yes --> J["7. CORS — Cross-Origin headers"]
+    I -- no --> K["8. RequestID — X-Request-ID injection"]
+    J --> K
+    K --> L["9. TraceContext — W3C traceparent / tracestate"]
+    L --> M{"Timeout configured?"}
+    M -- yes --> N["10. Timeout — per-request deadline"]
+    M -- no --> O{"Compress enabled?"}
+    N --> O
+    O -- yes --> P["11. Compress — gzip encoding"]
+    O -- no --> Q{"Admin configured?"}
+    P --> Q
+    Q -- yes --> R["12. Admin Collector — per-route metrics"]
+    Q -- no --> S["13. User Middlewares — cfg.Middlewares"]
+    R --> S
+    S --> T["Handler mux"]
 ```
 
 Custom middleware passed via `Middlewares` runs after all built-in layers and before the handler. Index 0 executes first.
@@ -484,6 +506,14 @@ Evaluation order: Allowlist → Blocklist → allow. Empty Allowlist + empty Blo
 
 HSTS is only added when `ENV=production`. The admin and swagger UI pages override the CSP to allow their embedded scripts and styles.
 
+> **CSRF note:** This library does not include CSRF token middleware because the
+> built-in JSON API endpoints rely on `Content-Type: application/json` which is
+> not submittable by plain HTML forms (the browser's SOP blocks cross-origin
+> `fetch` with credentials unless CORS explicitly allows it). If your
+> application serves HTML forms or accepts `application/x-www-form-urlencoded`
+> requests that mutate state, add a dedicated CSRF middleware (e.g.
+> double-submit cookie or synchroniser token) to `HTTPServerConfig.Middlewares`.
+
 ### Compress
 
 ```go
@@ -534,6 +564,38 @@ id := middleware.RequestIDFromContext(r)
 | `Generator` | `func() string` | 16-byte random hex | ID generator for requests without one |
 
 If the incoming request already carries the header, the existing value is preserved.
+
+### Trace context (W3C)
+
+```go
+// Default — enabled automatically; no configuration needed.
+// Disable explicitly:
+middleware.TraceContext(middleware.TraceContextConfig{Disabled: true})
+
+// Downstream access:
+info := middleware.TraceInfoFromContext(r)
+fmt.Println(info.TraceID, info.SpanID, info.ParentSpanID)
+```
+
+| Field      | Type   | Description                                                     |
+| ---------- | ------ | --------------------------------------------------------------- |
+| `Disabled` | `bool` | Set true to turn off trace-context propagation (default: false) |
+
+Propagates the `traceparent` and `tracestate` headers per the
+[W3C Trace Context](https://www.w3.org/TR/trace-context/) specification.
+When the incoming request carries a valid `traceparent`, the trace-id and
+flags are preserved; a new span-id is generated for this service. When
+absent or malformed, a brand-new trace is started.
+
+`TraceInfoFromContext(r)` returns a `TraceInfo` struct:
+
+| Field          | Type     | Description                              |
+| -------------- | -------- | ---------------------------------------- |
+| `TraceID`      | `string` | 32-hex-char trace identifier             |
+| `SpanID`       | `string` | 16-hex-char span identifier (this hop)   |
+| `ParentSpanID` | `string` | 16-hex-char parent span from caller      |
+| `TraceFlags`   | `string` | 2-hex-char flags (e.g. `"01"` = sampled) |
+| `TraceState`   | `string` | Vendor-specific tracestate value         |
 
 ### Request size
 
@@ -1113,4 +1175,4 @@ json.NewDecoder(w.Body).Decode(&resp)
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+Source-available — use and clone permitted; modifications, redistribution, and contributions are not accepted. See [LICENSE](LICENSE) for details.
