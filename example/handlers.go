@@ -331,6 +331,8 @@ func getAdmin(w http.ResponseWriter, r *http.Request) {
 }
 
 // getIP demonstrates request.GetIPAddress.
+//
+//nolint:staticcheck // Intentional use of deprecated GetIPAddress for backward-compat demo.
 func getIP(w http.ResponseWriter, r *http.Request) {
 	type IPResult struct {
 		IP string `json:"ip"`

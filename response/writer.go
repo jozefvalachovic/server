@@ -213,7 +213,7 @@ func etagMatch(header, etag string) bool {
 	if header == "*" {
 		return true
 	}
-	for _, part := range strings.Split(header, ",") {
+	for part := range strings.SplitSeq(header, ",") {
 		candidate := strings.TrimSpace(part)
 		candidate = strings.TrimPrefix(candidate, "W/")
 		if candidate == etag {

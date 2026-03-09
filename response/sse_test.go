@@ -91,11 +91,11 @@ func TestSSEWriter_SendError_WritesErrorEvent(t *testing.T) {
 	}
 
 	// Extract the data line.
-	dataIdx := strings.Index(body, "data: ")
-	if dataIdx == -1 {
+	_, after, ok := strings.Cut(body, "data: ")
+	if !ok {
 		t.Fatal("expected data: line in error event")
 	}
-	jsonStr := strings.TrimSpace(body[dataIdx+6:])
+	jsonStr := strings.TrimSpace(after)
 	var envelope APIStream[string]
 	if err := json.Unmarshal([]byte(jsonStr), &envelope); err != nil {
 		t.Fatalf("decode failed: %v", err)
