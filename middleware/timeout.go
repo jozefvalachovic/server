@@ -153,6 +153,19 @@ func (tw *timeoutWriter) Write(b []byte) (int, error) {
 	return tw.ResponseWriter.Write(b)
 }
 
+// Flush implements http.Flusher so that SSE and streaming responses work
+// correctly when the Timeout middleware wraps the ResponseWriter.
+func (tw *timeoutWriter) Flush() {
+	tw.mu.Lock()
+	defer tw.mu.Unlock()
+	if tw.timedOut {
+		return
+	}
+	if f, ok := tw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // timeout atomically marks the writer as timed out.
 // Returns true (and safe to write 504) only when the handler had not yet
 // committed any bytes; false when a response was already started.

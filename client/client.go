@@ -280,7 +280,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 		if attempt > 0 {
 			if !canRetryBody {
 				// Body is not re-readable; stop here rather than sending empty payload.
-				break
+				return nil, fmt.Errorf("retry aborted: request body is not re-readable: %w", lastErr)
 			}
 			// Recreate the body from GetBody so the retry sends the full payload.
 			if req.GetBody != nil {
@@ -311,6 +311,11 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 				c.cb.recordFailure()
 			}
 			if resp != nil {
+				// Capture the status so the final error message is informative
+				// even when the HTTP round-trip itself succeeded (no transport error).
+				if lastErr == nil {
+					lastErr = fmt.Errorf("server returned HTTP %d", resp.StatusCode)
+				}
 				// Drain up to 1 MiB before closing so the transport can reuse the
 				// underlying TCP connection. Bodies larger than the cap are not
 				// worth keeping — the connection will be discarded instead.

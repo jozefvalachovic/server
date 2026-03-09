@@ -42,7 +42,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jozefvalachovic/server/ui"
+	"github.com/jozefvalachovic/server/internal/ui"
 )
 
 // Handler returns an http.Handler that serves the API documentation UI.

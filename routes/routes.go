@@ -21,6 +21,10 @@ type CacheConfig = cache.CacheConfig
 // activeStore is set by RegisterRoutes and used by CachedRouteHandler so
 // registrars never need to receive or forward the *cache.CacheStore pointer.
 // Protected by activeStoreMu against concurrent access (e.g. parallel tests).
+//
+// IMPORTANT: CachedRouteHandler must only be called synchronously inside a
+// RegisterRouteRegistrar callback (while RegisterRoutes holds the lock).
+// Calling it from a goroutine spawned by a registrar may read a stale store.
 var (
 	activeStore   *cache.CacheStore
 	activeStoreMu sync.RWMutex

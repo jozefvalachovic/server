@@ -62,6 +62,7 @@ func main() {
 		DefaultTTL:      300 * time.Second,
 		CleanupInterval: 30 * time.Second,
 		MaxSize:         300,
+		MaxMemoryMB:     128,
 	}
 
 	store, err := routes.RegisterRoutes(mux, cacheConfig,

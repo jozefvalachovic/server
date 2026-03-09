@@ -13,7 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jozefvalachovic/server/config"
+	lib "github.com/jozefvalachovic/server"
+	"github.com/jozefvalachovic/server/internal/config"
 	"github.com/jozefvalachovic/server/middleware"
 
 	"github.com/jozefvalachovic/logger/v4"
@@ -59,12 +60,21 @@ type TCPServerConfig struct {
 	OTelBridge *OTelBridgeConfig
 
 	// ReadTimeout overrides the per-operation read deadline.
-	// Default: config.TCPReadTimeout.
+	// Default: config.TCPReadTimeout. See NoReadTimeout to disable entirely.
 	ReadTimeout time.Duration
 
 	// WriteTimeout overrides the per-operation write deadline.
-	// Default: config.TCPWriteTimeout.
+	// Default: config.TCPWriteTimeout. See NoWriteTimeout to disable entirely.
 	WriteTimeout time.Duration
+
+	// NoReadTimeout disables the read deadline entirely (zero value). Use when
+	// a connection-level read timeout is not desired and the default should not
+	// be applied. Has no effect when ReadTimeout is set to a positive value.
+	NoReadTimeout bool
+
+	// NoWriteTimeout disables the write deadline entirely. Same semantics as
+	// NoReadTimeout but for write deadlines.
+	NoWriteTimeout bool
 
 	// Middlewares are additional TCP middlewares applied after the built-in
 	// stack (logging, rate limiting). Applied in slice order.
@@ -94,6 +104,8 @@ type TCPServer struct {
 
 	appReadTimeout  time.Duration
 	appWriteTimeout time.Duration
+	noReadTimeout   bool
+	noWriteTimeout  bool
 
 	handler func(conn net.Conn)
 	wg      sync.WaitGroup
@@ -104,6 +116,10 @@ type TCPServer struct {
 // Environment variables TCP_HOST (IP literal, e.g. 0.0.0.0) and TCP_PORT must be set.
 // Returns an error if the environment configuration is invalid.
 func NewTCPServer(handler func(conn net.Conn), appName, appVersion string, cfg TCPServerConfig) (*TCPServer, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid TCPServerConfig: %w", err)
+	}
+
 	initLogger(cfg.OTelBridge)
 	log := logger.With("component", "tcp")
 
@@ -127,6 +143,7 @@ func NewTCPServer(handler func(conn net.Conn), appName, appVersion string, cfg T
 	log.LogDebug("Starting application...",
 		"App Name", appName,
 		"App Version", appVersion,
+		"Library Version", lib.Version,
 		"Golang Version", runtime.Version(),
 	)
 
@@ -176,6 +193,8 @@ func NewTCPServer(handler func(conn net.Conn), appName, appVersion string, cfg T
 
 		appReadTimeout:  readTimeout,
 		appWriteTimeout: writeTimeout,
+		noReadTimeout:   cfg.NoReadTimeout,
+		noWriteTimeout:  cfg.NoWriteTimeout,
 
 		ctx:           ctx,
 		cancel:        cancel,
@@ -245,11 +264,11 @@ func (s *TCPServer) Start() error {
 			}
 
 			readTimeout := s.appReadTimeout
-			if readTimeout == 0 {
+			if !s.noReadTimeout && readTimeout == 0 {
 				readTimeout = config.TCPReadTimeout
 			}
 			writeTimeout := s.appWriteTimeout
-			if writeTimeout == 0 {
+			if !s.noWriteTimeout && writeTimeout == 0 {
 				writeTimeout = config.TCPWriteTimeout
 			}
 			dc := &deadlineConn{
@@ -273,6 +292,9 @@ func (s *TCPServer) Start() error {
 					s.handleWithDeadlines(dc)
 				}()
 			default:
+				// Set a short write deadline so a misbehaving client cannot
+				// stall the server by never reading the rejection message.
+				_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
 				// Send error message before closing
 				if _, err := conn.Write([]byte(s.rejectMsg)); err != nil {
 					s.log.LogWarn("Failed to write rejection message", "remote", conn.RemoteAddr().String(), "error", err.Error())
@@ -288,6 +310,23 @@ func (s *TCPServer) Start() error {
 		}
 	}()
 
+	return nil
+}
+
+// StartWithContext starts the server and spawns a background goroutine that
+// triggers GracefulShutdown when ctx is cancelled. This is a convenience for
+// callers that manage server lifetime via context cancellation rather than
+// explicit shutdown calls.
+func (s *TCPServer) StartWithContext(ctx context.Context) error {
+	if err := s.Start(); err != nil {
+		return err
+	}
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), config.ShutdownTimeout)
+		defer cancel()
+		_ = s.GracefulShutdown(shutCtx)
+	}()
 	return nil
 }
 
@@ -394,9 +433,7 @@ func (s *TCPServer) GracefulShutdown(ctx context.Context) error {
 	}
 
 	// Drain logger buffers (async, dedup) before exiting.
-	logCtx, logCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer logCancel()
-	_ = logger.Shutdown(logCtx)
+	shutdownLogger()
 
 	return shutdownErr
 }
@@ -457,7 +494,5 @@ func (s *TCPServer) ForceShutdown() {
 	}
 
 	// Drain logger buffers (async, dedup) before exiting.
-	logCtx, logCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer logCancel()
-	_ = logger.Shutdown(logCtx)
+	shutdownLogger()
 }

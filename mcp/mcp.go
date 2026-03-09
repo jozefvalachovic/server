@@ -89,6 +89,10 @@ type Config struct {
 	// AllowedOrigins restricts the Access-Control-Allow-Origin header to the
 	// listed origins. When empty (the default) the header is set to "*".
 	AllowedOrigins []string
+	// AuthFunc is called before processing every JSON-RPC POST request.
+	// Return a non-nil error to reject the request with 401 Unauthorized.
+	// nil disables authentication (default).
+	AuthFunc func(r *http.Request) error
 }
 
 // Handler returns an http.Handler that implements the MCP Streamable HTTP
@@ -110,6 +114,11 @@ func Handler(cfg Config) http.Handler {
 		})
 	}
 
+	toolIndex := make(map[string]*toolDef, len(catalogue))
+	for i := range catalogue {
+		toolIndex[catalogue[i].tool.Name] = &catalogue[i]
+	}
+
 	// Pre-build static responses so no allocations occur on the hot path.
 	toolEntries := make([]toolEntry, len(catalogue))
 	for i, td := range catalogue {
@@ -122,15 +131,16 @@ func Handler(cfg Config) http.Handler {
 	capJSON, _ := json.Marshal(capabilityDoc{Name: cfg.Name, Version: cfg.Version, Protocol: "mcp"})
 	capJSON = append(capJSON, '\n')
 
-	allowedOrigin := "*"
-	if len(cfg.AllowedOrigins) > 0 {
-		allowedOrigin = strings.Join(cfg.AllowedOrigins, ", ")
+	allowedOrigins := cfg.AllowedOrigins
+	if len(allowedOrigins) == 0 {
+		allowedOrigins = []string{"*"}
 	}
 
 	s := &server{
-		cfg:           cfg,
-		allowedOrigin: allowedOrigin,
-		tools:         catalogue,
+		cfg:            cfg,
+		allowedOrigins: allowedOrigins,
+		tools:          catalogue,
+		toolIndex:      toolIndex,
 		initResult: initializeResult{
 			ProtocolVersion: "2024-11-05",
 			Capabilities:    initCapabilities{},
@@ -151,11 +161,12 @@ type toolDef struct {
 
 type server struct {
 	cfg            Config
-	allowedOrigin  string // pre-computed, immutable after construction
+	allowedOrigins []string // pre-computed, immutable after construction
 	tools          []toolDef
-	initResult     initializeResult // pre-built, immutable after construction
-	listResult     toolsListResult  // pre-built, immutable after construction
-	capabilityJSON []byte           // pre-encoded GET response
+	toolIndex      map[string]*toolDef // name → tool; O(1) dispatch
+	initResult     initializeResult    // pre-built, immutable after construction
+	listResult     toolsListResult     // pre-built, immutable after construction
+	capabilityJSON []byte              // pre-encoded GET response
 }
 
 // ── Typed response structs ────────────────────────────────────────────────────
@@ -239,14 +250,16 @@ const (
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// MCP uses POST for all JSON-RPC messages.
 	// Allow OPTIONS for CORS pre-flight (agents may run cross-origin).
+	origin := s.resolveOrigin(r.Header.Get("Origin"))
+
 	switch r.Method {
 	case http.MethodOptions:
-		setCORSHeaders(w, s.allowedOrigin)
+		setCORSHeaders(w, origin)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	case http.MethodGet:
 		// Some clients ping the endpoint; return a minimal capability document.
-		setCORSHeaders(w, s.allowedOrigin)
+		setCORSHeaders(w, origin)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_, _ = w.Write(s.capabilityJSON)
 		return
@@ -257,7 +270,19 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	setCORSHeaders(w, s.allowedOrigin)
+	setCORSHeaders(w, origin)
+
+	if s.cfg.AuthFunc != nil {
+		if err := s.cfg.AuthFunc(r); err != nil {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	// Cap the request body so a malicious or misconfigured agent cannot
+	// exhaust server memory. 1 MiB is generous for any JSON-RPC tool call.
+	const maxBodyBytes = 1 << 20 // 1 MiB
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 
 	var req rpcRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -328,38 +353,53 @@ func (s *server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 		return nil, &rpcError{Code: codeInvalidRequest, Message: "Invalid tools/call params"}
 	}
 
-	for _, td := range s.tools {
-		if td.tool.Name != p.Name {
-			continue
-		}
-		if p.Arguments == nil {
-			p.Arguments = json.RawMessage("{}")
-		}
-		result, err := td.tool.Handler(ctx, p.Arguments)
-		if err != nil {
-			return &toolCallResult{
-				Content: []contentBlock{{Type: "text", Text: err.Error()}},
-				IsError: true,
-			}, nil
-		}
-		// Serialise result to a JSON string for the text content block, so
-		// agents receive a predictable { type: "text", text: "<json>" } shape.
-		b, merr := json.Marshal(result)
-		if merr != nil {
-			return nil, &rpcError{Code: codeInternalError, Message: "Failed to serialise tool result"}
-		}
+	td, ok := s.toolIndex[p.Name]
+	if !ok {
+		return nil, &rpcError{Code: codeMethodNotFound, Message: fmt.Sprintf("Tool not found: %s", p.Name)}
+	}
+	if p.Arguments == nil {
+		p.Arguments = json.RawMessage("{}")
+	}
+	result, err := td.tool.Handler(ctx, p.Arguments)
+	if err != nil {
 		return &toolCallResult{
-			Content: []contentBlock{{Type: "text", Text: string(b)}},
+			Content: []contentBlock{{Type: "text", Text: err.Error()}},
+			IsError: true,
 		}, nil
 	}
-
-	return nil, &rpcError{Code: codeMethodNotFound, Message: fmt.Sprintf("Tool not found: %s", p.Name)}
+	b, merr := json.Marshal(result)
+	if merr != nil {
+		return nil, &rpcError{Code: codeInternalError, Message: "Failed to serialise tool result"}
+	}
+	return &toolCallResult{
+		Content: []contentBlock{{Type: "text", Text: string(b)}},
+	}, nil
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// resolveOrigin returns the origin to echo in Access-Control-Allow-Origin.
+// If the allowed list is ["*"], it returns "*". Otherwise, it checks the
+// request origin against the allowed list and returns it only if it matches.
+func (s *server) resolveOrigin(reqOrigin string) string {
+	if len(s.allowedOrigins) == 1 && s.allowedOrigins[0] == "*" {
+		return "*"
+	}
+	for _, o := range s.allowedOrigins {
+		if strings.EqualFold(o, reqOrigin) {
+			return reqOrigin
+		}
+	}
+	// No match — return the first allowed origin so the header is still set
+	// (browsers will block the request anyway).
+	return s.allowedOrigins[0]
+}
+
 func setCORSHeaders(w http.ResponseWriter, origin string) {
 	w.Header().Set("Access-Control-Allow-Origin", origin)
+	if origin != "*" {
+		w.Header().Add("Vary", "Origin")
+	}
 	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 }

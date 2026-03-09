@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	"github.com/jozefvalachovic/server/response"
+
+	"github.com/jozefvalachovic/logger/v4"
 )
 
 // IPFilterConfig configures the IPFilter middleware.
@@ -77,6 +79,7 @@ func IPFilter(cfgs ...IPFilterConfig) func(http.Handler) http.Handler {
 
 	state := &ipFilterState{cfg: cfg}
 	for _, cidr := range cfg.Allowlist {
+		raw := cidr
 		if !strings.Contains(cidr, "/") {
 			if strings.Contains(cidr, ":") {
 				cidr += "/128" // IPv6
@@ -85,11 +88,14 @@ func IPFilter(cfgs ...IPFilterConfig) func(http.Handler) http.Handler {
 			}
 		}
 		_, n, err := net.ParseCIDR(cidr)
-		if err == nil {
-			state.allowNets = append(state.allowNets, n)
+		if err != nil {
+			logger.LogWarn("IPFilter: invalid CIDR in Allowlist, entry skipped", "cidr", raw, "error", err.Error())
+			continue
 		}
+		state.allowNets = append(state.allowNets, n)
 	}
 	for _, cidr := range cfg.Blocklist {
+		raw := cidr
 		if !strings.Contains(cidr, "/") {
 			if strings.Contains(cidr, ":") {
 				cidr += "/128"
@@ -98,11 +104,14 @@ func IPFilter(cfgs ...IPFilterConfig) func(http.Handler) http.Handler {
 			}
 		}
 		_, n, err := net.ParseCIDR(cidr)
-		if err == nil {
-			state.blockNets = append(state.blockNets, n)
+		if err != nil {
+			logger.LogWarn("IPFilter: invalid CIDR in Blocklist, entry skipped", "cidr", raw, "error", err.Error())
+			continue
 		}
+		state.blockNets = append(state.blockNets, n)
 	}
 	for _, cidr := range cfg.TrustedProxies {
+		raw := cidr
 		if !strings.Contains(cidr, "/") {
 			if strings.Contains(cidr, ":") {
 				cidr += "/128"
@@ -111,9 +120,15 @@ func IPFilter(cfgs ...IPFilterConfig) func(http.Handler) http.Handler {
 			}
 		}
 		_, n, err := net.ParseCIDR(cidr)
-		if err == nil {
-			state.proxyNets = append(state.proxyNets, n)
+		if err != nil {
+			logger.LogWarn("IPFilter: invalid CIDR in TrustedProxies, entry skipped", "cidr", raw, "error", err.Error())
+			continue
 		}
+		state.proxyNets = append(state.proxyNets, n)
+	}
+
+	if cfg.TrustForwardedFor && len(state.proxyNets) == 0 {
+		logger.LogWarn("IPFilter: TrustForwardedFor is enabled but no valid TrustedProxies configured — X-Forwarded-For will be ignored, falling back to RemoteAddr")
 	}
 
 	return func(next http.Handler) http.Handler {

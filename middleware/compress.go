@@ -165,6 +165,9 @@ func Compress(cfgs ...CompressConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+				// Vary must be set even when compression is not applied so that
+				// shared caches (CDNs) store separate variants for gzip vs plain.
+				w.Header().Add("Vary", "Accept-Encoding")
 				next.ServeHTTP(w, r)
 				return
 			}

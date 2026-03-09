@@ -32,6 +32,7 @@ func setupIntegrationServer(t *testing.T) *httptest.Server {
 		DefaultTTL:      300 * time.Second,
 		CleanupInterval: 30 * time.Second,
 		MaxSize:         100,
+		MaxMemoryMB:     64,
 	}
 
 	store, err := routes.RegisterRoutes(mux, cacheConfig,

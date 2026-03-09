@@ -330,6 +330,7 @@ func TestRegisterRoutes_WithValidCacheConfig_StoreIsNonNil(t *testing.T) {
 		DefaultTTL:      10 * time.Second,
 		CleanupInterval: 5 * time.Second,
 		MaxSize:         10,
+		MaxMemoryMB:     16,
 	}
 
 	store, err := RegisterRoutes(mux, cfg)
@@ -349,6 +350,7 @@ func TestRegisterRoutes_WithInvalidCacheConfig_ReturnsError(t *testing.T) {
 		DefaultTTL:      0,
 		CleanupInterval: 5 * time.Second,
 		MaxSize:         10,
+		MaxMemoryMB:     16,
 	}
 
 	store, err := RegisterRoutes(mux, cfg)
@@ -369,6 +371,7 @@ func newRoutesTestStore(t *testing.T) *cache.CacheStore {
 		DefaultTTL:      10 * time.Second,
 		CleanupInterval: 5 * time.Second,
 		MaxSize:         50,
+		MaxMemoryMB:     32,
 	})
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)

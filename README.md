@@ -62,7 +62,7 @@ func main() {
 
     mux := http.NewServeMux()
     store, _ := routes.RegisterRoutes(mux, &cache.CacheConfig{
-        MaxSize: 1000, DefaultTTL: 5 * time.Minute, CleanupInterval: time.Minute,
+        MaxSize: 1000, MaxMemoryMB: 256, DefaultTTL: 5 * time.Minute, CleanupInterval: time.Minute,
     }, func(mux *http.ServeMux) {
         mux.HandleFunc("GET /ping", func(w http.ResponseWriter, r *http.Request) {
             response.APIResponseWriter(w, "pong", http.StatusOK)
@@ -121,9 +121,9 @@ Run the bundled example with hot-reload:
 | [`client`](#client)         | `server/client`     | Resilient HTTP client with retry and circuit breaker          |
 | [`mcp`](#mcp)               | `server/mcp`        | Model Context Protocol (MCP) tool server                      |
 | [`swagger`](#swagger)       | `server/swagger`    | Auto-generated Swagger UI from Go types                       |
-| [`admin`](#admin)           | `server/admin`      | Password-protected metrics and cache explorer UI              |
 | [`watch`](#watch)           | `server/watch`      | Hot-reload file watcher for development                       |
-| [`config`](#config)         | `server/config`     | Default timeouts, limits, and shared constants                |
+
+Internal packages (`internal/admin`, `internal/config`, `internal/ui`) are not importable by external consumers. The admin dashboard and shared constants are wired automatically by `server.NewHTTPServer`.
 
 The `server` package re-exports client and middleware config types so most applications only need a single import:
 
@@ -416,6 +416,8 @@ middleware.CORS(middleware.CORSConfig{
 
 `AllowCredentials: true` with a wildcard `"*"` origin panics at startup — the Fetch spec forbids this combination.
 
+Origin matching is case-insensitive per RFC 6454 (`strings.EqualFold`), so `"HTTPS://Example.COM"` matches a browser-sent `"https://example.com"`.
+
 ### Rate limiting
 
 #### HTTP
@@ -529,6 +531,8 @@ middleware.Compress(middleware.CompressConfig{
 | `Enabled`      | `bool`     | false                                                                    | Must be explicitly true to activate              |
 | `Level`        | `int`      | `gzip.DefaultCompression`                                                | gzip level (1 = BestSpeed … 9 = BestCompression) |
 | `ContentTypes` | `[]string` | `application/json`, `application/xml`, `text/`, `application/javascript` | Content-Type prefixes eligible for compression   |
+
+`Vary: Accept-Encoding` is set on every response (compressed or not) so that shared caches (CDNs) store separate variants for gzip-capable and plain clients.
 
 ### Timeout
 
@@ -676,8 +680,30 @@ Typed JSON response writers and request body decoding.
 // Success
 response.APIResponseWriter(w, product, http.StatusOK)
 
-// Paginated
+// Success with message
+response.APIResponseWriterWithMessage(w, user, http.StatusOK, "User updated successfully")
+
+// 201 Created with Location header
+response.APICreated(w, product, "/products/"+product.ID)
+
+// 204 No Content (DELETE, PUT with no body)
+response.APINoContent(w)
+
+// Offset pagination
 response.APIResponseWriterWithPagination(w, products, http.StatusOK, limit, offset, totalCount)
+
+// Cursor pagination
+response.APIResponseWriterWithCursorPagination(w, products, http.StatusOK, response.ResponseCursorPagination{
+    NextCursor: nextCur,
+    HasMore:    len(products) == pageSize,
+    PageSize:   pageSize,
+})
+
+// Warnings (deprecation notices, partial success)
+response.APIResponseWriterWithWarnings(w, data, http.StatusOK, []string{"This endpoint is deprecated. Use /v2/products."})
+
+// ETag + conditional 304 Not Modified
+response.APIResponseWriterWithETag(w, r, data, http.StatusOK)
 
 // Error with details
 response.APIErrorWriter(w, response.APIError[any]{
@@ -686,9 +712,24 @@ response.APIErrorWriter(w, response.APIError[any]{
     Details: "field 'name' is required",
 })
 
-// Convenience helpers
+// Error shortcuts
+response.APIBadRequest(w, "validation failed", "field 'name' is required")
 response.APIUnauthorized(w, "invalid token")
 response.APIForbidden(w, "insufficient permissions")
+response.APINotFound(w, "user not found")
+response.APIConflict(w, "email already taken")
+response.APIInternalError(w, "unexpected failure")
+response.APIServiceUnavailable(w, "try again later")
+
+// SSE streaming
+stream := response.NewSSEWriter[Event](w, r)
+defer stream.Close()
+for event := range ch {
+    if err := stream.Send(event); err != nil {
+        break
+    }
+}
+stream.SendHeartbeat() // keep-alive comment
 
 // Decode + validate request body (rejects unknown fields)
 product, apiErr := response.ValidateAndDecode[Product](r)
@@ -705,6 +746,7 @@ if apiErr != nil {
   "code": 200,
   "data": { ... },
   "message": "optional",
+  "warnings": ["optional deprecation notice"],
   "metadata": { ... },
   "preferences": { ... },
   "pagination": {
@@ -714,6 +756,12 @@ if apiErr != nil {
     "totalPages": 8,
     "currentPage": 1,
     "hasMore": true
+  },
+  "cursorPagination": {
+    "nextCursor": "eyJpZCI6MTAwfQ",
+    "prevCursor": "eyJpZCI6ODF9",
+    "hasMore": true,
+    "pageSize": 20
   }
 }
 ```
@@ -742,14 +790,48 @@ if apiErr != nil {
 }
 ```
 
+**Writers:**
+
+| Function                                   | Description                                                        |
+| ------------------------------------------ | ------------------------------------------------------------------ |
+| `APIResponseWriter[T]`                     | Standard success response                                          |
+| `APIResponseWriterWithMessage[T]`          | Success response with informational message                        |
+| `APIResponseWriterWithPagination[T]`       | Success response with offset-based pagination                      |
+| `APIResponseWriterWithCursorPagination[T]` | Success response with cursor-based pagination                      |
+| `APIResponseWriterWithWarnings[T]`         | Success response with warning strings                              |
+| `APIResponseWriterWithETag[T]`             | Success response with ETag; returns 304 if `If-None-Match` matches |
+| `APICreated[T]`                            | 201 Created with `Location` header                                 |
+| `APINoContent`                             | 204 No Content (no body)                                           |
+| `APIErrorWriter[T]`                        | Generic error response from `APIError[T]`                          |
+| `APIBadRequest`                            | 400 shortcut with message + details                                |
+| `APIUnauthorized`                          | 401 shortcut                                                       |
+| `APIForbidden`                             | 403 shortcut                                                       |
+| `APINotFound`                              | 404 shortcut                                                       |
+| `APIConflict`                              | 409 shortcut                                                       |
+| `APIInternalError`                         | 500 shortcut                                                       |
+| `APIServiceUnavailable`                    | 503 shortcut                                                       |
+
+**SSE streaming:**
+
+| Method                  | Description                                                |
+| ----------------------- | ---------------------------------------------------------- |
+| `NewSSEWriter[T](w, r)` | Initialises an SSE stream (sets headers, returns writer)   |
+| `Send(data T)`          | Writes a `data:` event with an `APIStream[T]` envelope     |
+| `SendError(msg, det)`   | Writes an `event: error` event and closes the stream       |
+| `SendHeartbeat()`       | Writes a keep-alive comment with a `HeartbeatData` payload |
+| `Close()`               | Writes a final `event: done` and marks the writer closed   |
+
 **Types:**
 
-| Type             | Description                                                            |
-| ---------------- | ---------------------------------------------------------------------- |
-| `APIResponse[T]` | Success envelope with optional `Metadata`, `Preferences`, `Pagination` |
-| `APIError[T]`    | Error envelope with `Error`, `Message`, `Details`, optional `Data`     |
-| `APIStream[T]`   | Streaming event envelope                                               |
-| `HeartbeatData`  | SSE heartbeat payload (`type`, `timestamp`, `sent`)                    |
+| Type                       | Description                                                            |
+| -------------------------- | ---------------------------------------------------------------------- |
+| `APIResponse[T]`           | Success envelope with optional `Metadata`, `Preferences`, `Pagination` |
+| `ResponseOffsetPagination` | Offset-based pagination metadata                                       |
+| `ResponseCursorPagination` | Cursor-based pagination metadata                                       |
+| `APIError[T]`              | Error envelope with `Error`, `Message`, `Details`, optional `Data`     |
+| `APIStream[T]`             | Streaming event envelope                                               |
+| `SSEWriter[T]`             | Server-Sent Events writer with heartbeats and context awareness        |
+| `HeartbeatData`            | SSE heartbeat payload (`type`, `timestamp`, `sent`)                    |
 
 `ValidateAndDecode[T]` rejects unknown JSON fields, nil/empty bodies, and bodies exceeding the `MaxBytesReader` limit (returns 413).
 
@@ -758,10 +840,13 @@ if apiErr != nil {
 ## request
 
 ```go
-ip := request.GetIPAddress(r)          // checks X-Forwarded-For, X-Real-IP, RemoteAddr
 err := request.ValidateEmail(email)     // RFC 5322 validation
 clean := request.SanitizeEmail(email)   // lowercase + trim
 ```
+
+> **Deprecated:** `request.GetIPAddress` is deprecated. Use `middleware.IPFilter`
+> with `TrustedProxies` for secure client-IP resolution that prevents spoofing
+> via `X-Forwarded-For`.
 
 ---
 
@@ -773,10 +858,10 @@ The eviction policy is **oldest-first (FIFO)**: a min-heap ordered by `createdAt
 
 ```go
 store, err := cache.NewCacheStore(cache.CacheConfig{
-    MaxSize:         10_000,           // max entries; 0 = no entry-count limit
+    MaxSize:         10_000,           // max entries; required (> 0)
     DefaultTTL:      5 * time.Minute,  // required (> 0)
     CleanupInterval: time.Minute,      // required (> 0)
-    MaxMemoryMB:     256,              // optional byte-level memory cap
+    MaxMemoryMB:     256,              // byte-level memory cap; required (> 0)
 })
 defer store.Stop()
 
@@ -893,6 +978,12 @@ routes.RegisterMCP(mux, "/mcp", mcp.Config{
     Name:    "my-service",
     Version: "1.0.0",
     AllowedOrigins: []string{"https://app.example.com"},
+    AuthFunc: func(r *http.Request) error {
+        if r.Header.Get("Authorization") != "Bearer secret" {
+            return fmt.Errorf("unauthorized")
+        }
+        return nil
+    },
     Tools: []mcp.Tool{
         {
             Name:        "get_product",
@@ -909,6 +1000,18 @@ routes.RegisterMCP(mux, "/mcp", mcp.Config{
     },
 })
 ```
+
+**`Config` fields:**
+
+| Field            | Type                        | Default        | Description                                                 |
+| ---------------- | --------------------------- | -------------- | ----------------------------------------------------------- |
+| `Name`           | `string`                    | `"mcp-server"` | Server name in the `initialize` handshake                   |
+| `Version`        | `string`                    | `"1.0.0"`      | Server version in the `initialize` handshake                |
+| `Tools`          | `[]mcp.Tool`                | none           | Tools the agent may discover and call                       |
+| `AllowedOrigins` | `[]string`                  | `["*"]`        | Restricts the `Access-Control-Allow-Origin` header          |
+| `AuthFunc`       | `func(*http.Request) error` | nil (disabled) | Called before every POST; return non-nil to reject with 401 |
+
+POST request bodies are capped at **1 MiB** (`http.MaxBytesReader`) to prevent unbounded memory consumption from malicious or misconfigured agents.
 
 Input schemas are reflected automatically from the `Input` struct's fields and JSON tags.
 
@@ -940,6 +1043,8 @@ routes.RegisterSwagger(mux, "/docs", swagger.Config{
 
 ## admin
 
+> **Internal package** (`internal/admin`) — not directly importable. Configured via `server.AdminConfig`.
+
 Password-protected admin UI with per-route metrics and cache explorer. Requires `ADMIN_NAME` and `ADMIN_SECRET` environment variables.
 
 ```go
@@ -964,7 +1069,7 @@ When `Admin` is set, `NewHTTPServer` creates a `Collector`, registers all admin 
 | `/metrics/auth` | Login page for the metrics section           |
 | `/cache/auth`   | Login page for the cache section             |
 
-Session-based HMAC-SHA256 auth with 8-hour TTL cookie.
+Session-based HMAC-SHA256 auth with 8-hour TTL cookie. Login attempts are rate-limited to 5 per IP address within a 15-minute window.
 
 **Standalone usage** (without `NewHTTPServer`):
 
@@ -1017,6 +1122,8 @@ watch.Init(watch.Config{
 ---
 
 ## config
+
+> **Internal package** (`internal/config`) — not directly importable. Defaults are applied automatically by `server.NewHTTPServer`.
 
 Shared default constants used by the server and middleware packages:
 
@@ -1149,7 +1256,7 @@ Create a standalone `CacheStore` per test to avoid shared state:
 
 ```go
 store, err := cache.NewCacheStore(cache.CacheConfig{
-    MaxSize: 100, DefaultTTL: time.Minute, CleanupInterval: time.Minute,
+    MaxSize: 100, MaxMemoryMB: 64, DefaultTTL: time.Minute, CleanupInterval: time.Minute,
 })
 if err != nil {
     t.Fatal(err)

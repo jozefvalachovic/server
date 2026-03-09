@@ -1,9 +1,11 @@
 package admin
 
 import (
+	"cmp"
 	"fmt"
 	"math"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -157,6 +159,9 @@ func (c *Collector) Snapshots() []RouteSnapshot {
 			AvgBytes:   avgBytes,
 		})
 		return true
+	})
+	slices.SortFunc(out, func(a, b RouteSnapshot) int {
+		return cmp.Compare(a.Pattern, b.Pattern)
 	})
 	return out
 }

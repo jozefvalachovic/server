@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jozefvalachovic/server/response"
@@ -13,7 +14,7 @@ import (
 type rateBucket struct {
 	mu       sync.Mutex
 	tokens   float64
-	lastSeen time.Time
+	lastSeen atomic.Int64 // UnixNano; read atomically by cleanup without locking mu
 }
 
 // HTTPRateLimitConfig configures the HTTPRateLimit middleware.
@@ -123,9 +124,7 @@ func HTTPRateLimit(cfgs ...HTTPRateLimitConfig) func(http.Handler) http.Handler 
 				mu.RLock()
 				var stale []string
 				for key, b := range buckets {
-					b.mu.Lock()
-					idle := now.Sub(b.lastSeen)
-					b.mu.Unlock()
+					idle := now.Sub(time.Unix(0, b.lastSeen.Load()))
 					if idle > cfg.IdleTimeout {
 						stale = append(stale, key)
 					}
@@ -154,16 +153,17 @@ func HTTPRateLimit(cfgs ...HTTPRateLimitConfig) func(http.Handler) http.Handler 
 				mu.Lock()
 				b, ok = buckets[key]
 				if !ok {
-					b = &rateBucket{tokens: burst, lastSeen: now}
+					b = &rateBucket{tokens: burst}
+					b.lastSeen.Store(now.UnixNano())
 					buckets[key] = b
 				}
 				mu.Unlock()
 			}
 
 			b.mu.Lock()
-			elapsed := now.Sub(b.lastSeen).Seconds()
+			elapsed := now.Sub(time.Unix(0, b.lastSeen.Load())).Seconds()
 			b.tokens = min(burst, b.tokens+elapsed*rate)
-			b.lastSeen = now
+			b.lastSeen.Store(now.UnixNano())
 			allow := b.tokens >= 1
 			if allow {
 				b.tokens--
@@ -302,9 +302,7 @@ func TCPRateLimit(cfgs ...TCPRateLimitConfig) func(func(net.Conn)) func(net.Conn
 				mu.RLock()
 				var stale []string
 				for key, b := range buckets {
-					b.mu.Lock()
-					idle := now.Sub(b.lastSeen)
-					b.mu.Unlock()
+					idle := now.Sub(time.Unix(0, b.lastSeen.Load()))
 					if idle > cfg.IdleTimeout {
 						stale = append(stale, key)
 					}
@@ -333,16 +331,17 @@ func TCPRateLimit(cfgs ...TCPRateLimitConfig) func(func(net.Conn)) func(net.Conn
 				mu.Lock()
 				b, ok = buckets[key]
 				if !ok {
-					b = &rateBucket{tokens: burst, lastSeen: now}
+					b = &rateBucket{tokens: burst}
+					b.lastSeen.Store(now.UnixNano())
 					buckets[key] = b
 				}
 				mu.Unlock()
 			}
 
 			b.mu.Lock()
-			elapsed := now.Sub(b.lastSeen).Seconds()
+			elapsed := now.Sub(time.Unix(0, b.lastSeen.Load())).Seconds()
 			b.tokens = min(burst, b.tokens+elapsed*rate)
-			b.lastSeen = now
+			b.lastSeen.Store(now.UnixNano())
 			allow := b.tokens >= 1
 			if allow {
 				b.tokens--

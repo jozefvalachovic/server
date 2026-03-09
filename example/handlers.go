@@ -172,7 +172,7 @@ func createProduct(w http.ResponseWriter, r *http.Request) {
 	products = append(products, p)
 	mu.Unlock()
 
-	response.APIResponseWriter(w, p, http.StatusCreated)
+	response.APICreated(w, p, "/products/"+strconv.Itoa(p.ID))
 }
 
 func getProduct(w http.ResponseWriter, r *http.Request) {
@@ -299,7 +299,7 @@ func deleteProduct(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	response.APINoContent(w)
 }
 
 // ── util handlers ─────────────────────────────────────────────────────────────
@@ -374,6 +374,7 @@ func cacheDemo(w http.ResponseWriter, r *http.Request) {
 		MaxSize:         10,
 		DefaultTTL:      5 * time.Second,
 		CleanupInterval: 2 * time.Second,
+		MaxMemoryMB:     1,
 	})
 	if err != nil {
 		response.APIErrorWriter(w, response.APIError[any]{

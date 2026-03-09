@@ -105,6 +105,7 @@ func TestCacheStore_ConcurrentEviction(t *testing.T) {
 		MaxSize:         20, // tiny limit to force evictions
 		DefaultTTL:      time.Minute,
 		CleanupInterval: time.Hour,
+		MaxMemoryMB:     1,
 	})
 	if err != nil {
 		t.Fatal(err)

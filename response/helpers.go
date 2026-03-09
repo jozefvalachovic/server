@@ -48,30 +48,52 @@ func ValidateAndDecode[T any](r *http.Request) (T, *APIError[T]) {
 func CreateEmptyData[T any]() *T {
 	var result T
 
-	// Initialize common empty types
-	valueOf := reflect.ValueOf(&result).Elem()
-	typeOf := valueOf.Type()
+	// Fast path: interface types (T=any) — nil is correct for JSON.
+	if any(result) == nil {
+		return &result
+	}
 
-	switch typeOf.Kind() {
+	// Fast path: value types can never be nil; no initialization needed.
+	switch any(result).(type) {
+	case string, bool,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		float32, float64:
+		return &result
+	}
+
+	// Composite types (slice, map, pointer) may need initialization
+	// so JSON serializes as [] or {} instead of null.
+	valueOf := reflect.ValueOf(&result).Elem()
+	switch valueOf.Kind() {
 	case reflect.Slice:
-		if valueOf.IsNil() {
-			// Create empty slice
-			emptySlice := reflect.MakeSlice(typeOf, 0, 0)
-			valueOf.Set(emptySlice)
-		}
+		valueOf.Set(reflect.MakeSlice(valueOf.Type(), 0, 0))
 	case reflect.Map:
-		if valueOf.IsNil() {
-			// Create empty map
-			emptyMap := reflect.MakeMap(typeOf)
-			valueOf.Set(emptyMap)
-		}
+		valueOf.Set(reflect.MakeMap(valueOf.Type()))
 	case reflect.Pointer:
-		if valueOf.IsNil() && typeOf.Elem().Kind() == reflect.Struct {
-			// Create new struct for pointer types
-			newStruct := reflect.New(typeOf.Elem())
-			valueOf.Set(newStruct)
+		if valueOf.Type().Elem().Kind() == reflect.Struct {
+			valueOf.Set(reflect.New(valueOf.Type().Elem()))
 		}
 	}
 
 	return &result
+}
+
+// resolveResponseData returns a pointer to data, substituting an initialized
+// empty value when data is nil or a typed nil (nil slice, nil map, etc.).
+// This consolidates reflect-based nil detection used by APIResponseWriter.
+func resolveResponseData[T any](data T) *T {
+	// Fast path: untyped nil (T=any with nil interface value).
+	if any(data) == nil {
+		return CreateEmptyData[T]()
+	}
+	// Typed nils (nil slice, nil pointer, etc.) require reflect.
+	rv := reflect.ValueOf(any(data))
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
+		if rv.IsNil() {
+			return CreateEmptyData[T]()
+		}
+	}
+	return &data
 }

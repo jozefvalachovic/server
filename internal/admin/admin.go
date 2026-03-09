@@ -43,7 +43,7 @@ import (
 	"time"
 
 	"github.com/jozefvalachovic/server/cache"
-	"github.com/jozefvalachovic/server/ui"
+	"github.com/jozefvalachovic/server/internal/ui"
 )
 
 // Config holds all options for the admin UI.

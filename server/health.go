@@ -108,9 +108,14 @@ func (h *HealthChecker) SetRedactCheckNames(v bool) {
 // Result runs all registered checks concurrently and returns the aggregated result.
 func (h *HealthChecker) Result(ctx context.Context) HealthCheckResult {
 	h.mu.RLock()
-	checks := make(map[string]CheckFunc, len(h.checks))
-	maps.Copy(checks, h.checks)
+	n := len(h.checks)
 	redact := h.redactNames
+	if n == 0 {
+		h.mu.RUnlock()
+		return HealthCheckResult{Status: HealthStatusOK, Version: h.version}
+	}
+	checks := make(map[string]CheckFunc, n)
+	maps.Copy(checks, h.checks)
 	h.mu.RUnlock()
 
 	type entry struct {

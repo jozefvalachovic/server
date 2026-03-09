@@ -18,6 +18,7 @@ func newTestStore(t *testing.T) *cache.CacheStore {
 		MaxSize:         100,
 		DefaultTTL:      10 * time.Second,
 		CleanupInterval: 5 * time.Second,
+		MaxMemoryMB:     64,
 	})
 	if err != nil {
 		t.Fatalf("failed to create test cache store: %v", err)

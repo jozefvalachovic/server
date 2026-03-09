@@ -23,6 +23,7 @@ func newBenchStore(b *testing.B) *cache.CacheStore {
 		MaxSize:         1000,
 		DefaultTTL:      30 * time.Second,
 		CleanupInterval: 15 * time.Second,
+		MaxMemoryMB:     64,
 	})
 	if err != nil {
 		b.Fatalf("store: %v", err)

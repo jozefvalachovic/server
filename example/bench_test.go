@@ -220,6 +220,7 @@ func buildCachedListHandler(b *testing.B) http.Handler {
 		DefaultTTL:      300 * time.Second,
 		CleanupInterval: 30 * time.Second,
 		MaxSize:         300,
+		MaxMemoryMB:     128,
 	}
 	store, err := routes.RegisterRoutes(mux, cfg, func(m *http.ServeMux) {
 		m.HandleFunc("/products", routes.CachedRouteHandler(

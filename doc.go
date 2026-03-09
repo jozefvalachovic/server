@@ -33,7 +33,7 @@
 //	mux := http.NewServeMux()
 //
 //	store, err := routes.RegisterRoutes(mux, nil,
-//	    func(mux *http.ServeMux, store *cache.CacheStore) {
+//	    func(mux *http.ServeMux) {
 //	        routes.RegisterRouteList(mux, []routes.Route{
 //	            {Method: http.MethodGet,  Path: "/organisations", Handler: listOrgs},
 //	            {Method: http.MethodPost, Path: "/organisations", Handler: createOrg},

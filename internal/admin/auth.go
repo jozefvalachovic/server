@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -59,7 +61,8 @@ func validateToken(token, wantName, secret string) bool {
 }
 
 func signMAC(secret, msg string) string {
-	h := hmac.New(sha256.New, []byte(secret))
+	key := sha256.Sum256([]byte(secret))
+	h := hmac.New(sha256.New, key[:])
 	h.Write([]byte(msg))
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -85,7 +88,7 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, name, secret strin
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   r.TLS != nil,
+		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(sessionTTL.Seconds()),
 	})
@@ -118,6 +121,57 @@ func requireAdmin(next http.Handler, authRedirectURL string) http.Handler {
 // field on login forms. Not strictly required for a tool-operator UI, but good
 // hygiene. Currently unused — reserved for future hardening.
 
+// ── Login rate limiting ──────────────────────────────────────────────────────
+
+const (
+	loginMaxAttempts = 5
+	loginWindow      = 15 * time.Minute
+)
+
+var loginLimiter struct {
+	mu       sync.Mutex
+	attempts map[string][]time.Time
+}
+
+func init() {
+	loginLimiter.attempts = make(map[string][]time.Time)
+}
+
+// loginRateOK returns true if the IP has not exceeded the login attempt limit.
+func loginRateOK(ip string) bool {
+	loginLimiter.mu.Lock()
+	defer loginLimiter.mu.Unlock()
+	cutoff := time.Now().Add(-loginWindow)
+	recent := loginLimiter.attempts[ip]
+	n := 0
+	for _, t := range recent {
+		if t.After(cutoff) {
+			recent[n] = t
+			n++
+		}
+	}
+	if n == 0 {
+		delete(loginLimiter.attempts, ip)
+		return true
+	}
+	loginLimiter.attempts[ip] = recent[:n]
+	return n < loginMaxAttempts
+}
+
+func recordLoginFailure(ip string) {
+	loginLimiter.mu.Lock()
+	loginLimiter.attempts[ip] = append(loginLimiter.attempts[ip], time.Now())
+	loginLimiter.mu.Unlock()
+}
+
+func loginIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 // loginHandler returns GET (render form) and POST (validate, set cookie) handlers
 // for the given section. onSuccess is the default redirect after login.
 func loginHandler(section, onSuccess string, tmplFn func(w http.ResponseWriter, errMsg string)) (get http.HandlerFunc, post http.HandlerFunc) {
@@ -130,6 +184,12 @@ func loginHandler(section, onSuccess string, tmplFn func(w http.ResponseWriter, 
 	}
 
 	post = func(w http.ResponseWriter, r *http.Request) {
+		ip := loginIP(r)
+		if !loginRateOK(ip) {
+			http.Error(w, "Too many login attempts. Try again later.", http.StatusTooManyRequests)
+			return
+		}
+
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
@@ -146,6 +206,7 @@ func loginHandler(section, onSuccess string, tmplFn func(w http.ResponseWriter, 
 		nameOK := hmac.Equal([]byte(inputName), []byte(wantName))
 		passOK := hmac.Equal([]byte(inputPass), []byte(wantSecret))
 		if !nameOK || !passOK {
+			recordLoginFailure(ip)
 			tmplFn(w, "Invalid username or password.")
 			return
 		}

@@ -14,10 +14,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jozefvalachovic/server/admin"
+	lib "github.com/jozefvalachovic/server"
 	"github.com/jozefvalachovic/server/cache"
 	"github.com/jozefvalachovic/server/client"
-	"github.com/jozefvalachovic/server/config"
+	"github.com/jozefvalachovic/server/internal/admin"
+	"github.com/jozefvalachovic/server/internal/config"
 	"github.com/jozefvalachovic/server/middleware"
 
 	"github.com/jozefvalachovic/logger/v4"
@@ -40,10 +41,14 @@ type OTelBridgeConfig struct {
 	Handler slog.Handler
 }
 
-var initLoggerOnce sync.Once
+var (
+	initLoggerOnce sync.Once
+	initLoggerOTel *OTelBridgeConfig // first OTel config; used to detect conflicts
+)
 
 func initLogger(otel *OTelBridgeConfig) {
 	initLoggerOnce.Do(func() {
+		initLoggerOTel = otel
 		cfg := logger.ConfigFromEnv()
 		cfg.EnableDedup = true
 		cfg.EnableMetrics = true
@@ -56,6 +61,30 @@ func initLogger(otel *OTelBridgeConfig) {
 			cfg.AdditionalHandlers = append(cfg.AdditionalHandlers, bridge)
 		}
 		logger.SetConfig(cfg)
+	})
+
+	// Detect conflicting OTel configurations on subsequent calls.
+	switch {
+	case otel != nil && initLoggerOTel != nil:
+		if otel.ServiceName != initLoggerOTel.ServiceName || otel.ServiceVersion != initLoggerOTel.ServiceVersion {
+			logger.LogWarn("initLogger called with a different OTelBridgeConfig; first-caller config is used",
+				"firstService", initLoggerOTel.ServiceName, "firstVersion", initLoggerOTel.ServiceVersion,
+				"thisService", otel.ServiceName, "thisVersion", otel.ServiceVersion)
+		}
+	case (otel == nil) != (initLoggerOTel == nil):
+		logger.LogWarn("initLogger: OTelBridgeConfig presence differs from first initialization; first-caller config is used")
+	}
+}
+
+var shutdownLoggerOnce sync.Once
+
+func shutdownLogger() {
+	shutdownLoggerOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := logger.Shutdown(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "logger shutdown error: %v\n", err)
+		}
 	})
 }
 
@@ -149,13 +178,22 @@ type HTTPServerConfig struct {
 
 	// ReadTimeout is the maximum duration for reading the entire request,
 	// including the body. Default: config.DefaultReadTimeout (30 s).
-	// Set explicitly to override.
+	// Set explicitly to override. See NoReadTimeout to disable entirely.
 	ReadTimeout time.Duration
 
 	// WriteTimeout is the maximum duration before timing out writes of the
 	// response. Default: config.DefaultWriteTimeout (60 s).
-	// Set explicitly to override.
+	// Set explicitly to override. See NoWriteTimeout to disable entirely.
 	WriteTimeout time.Duration
+
+	// NoReadTimeout disables the read timeout entirely (sets http.Server.ReadTimeout
+	// to 0). Use when an explicit zero/infinite timeout is intended and the default
+	// should not be applied. Has no effect when ReadTimeout is set to a positive value.
+	NoReadTimeout bool
+
+	// NoWriteTimeout disables the write timeout entirely. Same semantics as
+	// NoReadTimeout but for http.Server.WriteTimeout.
+	NoWriteTimeout bool
 
 	// --- Observability ---
 
@@ -303,6 +341,10 @@ func (c *semConn) Close() error {
 // NewHTTPServer initializes a new HTTPServer.
 // Environment variables HTTP_HOST and HTTP_PORT must be set.
 func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServerConfig) (*HTTPServer, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid HTTPServerConfig: %w", err)
+	}
+
 	initLogger(cfg.OTelBridge)
 	log := logger.With("component", "http")
 
@@ -336,6 +378,7 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 	log.LogDebug("Starting application...",
 		"App Name", appName,
 		"App Version", appVersion,
+		"Library Version", lib.Version,
 		"Golang Version", runtime.Version(),
 	)
 
@@ -440,12 +483,13 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 	handler = loggerMiddleware.LogHTTPMiddleware(handler, logOpts...)
 
 	// Apply safe defaults when the caller omits read/write timeouts.
+	// NoReadTimeout / NoWriteTimeout opt out of defaults explicitly.
 	readTimeout := cfg.ReadTimeout
-	if readTimeout == 0 {
+	if !cfg.NoReadTimeout && readTimeout == 0 {
 		readTimeout = config.DefaultReadTimeout
 	}
 	writeTimeout := cfg.WriteTimeout
-	if writeTimeout == 0 {
+	if !cfg.NoWriteTimeout && writeTimeout == 0 {
 		writeTimeout = config.DefaultWriteTimeout
 	}
 
@@ -530,6 +574,23 @@ func (as *HTTPServer) Start() error {
 	return nil
 }
 
+// StartWithContext starts the server and spawns a background goroutine that
+// triggers GracefulShutdown when ctx is cancelled. This is a convenience for
+// callers that manage server lifetime via context cancellation rather than
+// explicit shutdown calls.
+func (as *HTTPServer) StartWithContext(ctx context.Context) error {
+	if err := as.Start(); err != nil {
+		return err
+	}
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), config.ShutdownTimeout)
+		defer cancel()
+		_ = as.GracefulShutdown(shutCtx)
+	}()
+	return nil
+}
+
 // GracefulShutdown performs graceful shutdown of the HTTP server.
 // The caller controls the deadline via ctx (typically context.WithTimeout).
 // Returns the first non-nil error encountered during shutdown.
@@ -566,9 +627,7 @@ func (as *HTTPServer) GracefulShutdown(ctx context.Context) error {
 	as.log.LogInfo("Server stopped gracefully")
 
 	// Drain logger buffers (async, dedup) before exiting.
-	logCtx, logCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer logCancel()
-	_ = logger.Shutdown(logCtx)
+	shutdownLogger()
 
 	return shutdownErr
 }
@@ -598,7 +657,5 @@ func (as *HTTPServer) ForceShutdown() {
 	as.log.LogInfo("Server closed forcefully")
 
 	// Drain logger buffers (async, dedup) before exiting.
-	logCtx, logCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer logCancel()
-	_ = logger.Shutdown(logCtx)
+	shutdownLogger()
 }

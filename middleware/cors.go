@@ -2,7 +2,6 @@ package middleware
 
 import (
 	"net/http"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -128,8 +127,11 @@ func CORS(cfgs ...CORSConfig) func(http.Handler) http.Handler {
 			if wildcard {
 				allowOrigin = "*"
 			} else {
-				if slices.Contains(allowedOrigins, origin) {
-					allowOrigin = origin
+				for _, o := range allowedOrigins {
+					if strings.EqualFold(o, origin) {
+						allowOrigin = origin
+						break
+					}
 				}
 			}
 			if allowOrigin == "" {

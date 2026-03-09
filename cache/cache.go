@@ -59,14 +59,18 @@ type CacheStats struct {
 	BytesUsed int64 `json:"bytesUsed"`
 }
 
-// CacheConfig holds configuration for cache behavior
+// CacheConfig holds configuration for cache behavior.
+// All fields are required unless stated otherwise.
 type CacheConfig struct {
+	// MaxSize is the maximum number of entries the cache may hold.
+	// When reached, the oldest entries are evicted before a new one is inserted.
+	// Must be > 0.
 	MaxSize         int           `json:"maxSize"`
 	DefaultTTL      time.Duration `json:"defaultTTL"`
 	CleanupInterval time.Duration `json:"cleanupInterval"`
 	// MaxMemoryMB caps the total estimated memory used by cached values.
-	// When exceeded, the oldest entries are evicted until usage drops below
-	// the limit. 0 disables byte-based eviction (only MaxSize applies).
+	// When reached, the oldest entries are evicted before a new one is inserted.
+	// Must be > 0.
 	MaxMemoryMB int `json:"maxMemoryMB"`
 }
 
@@ -113,16 +117,19 @@ type cacheEntry struct {
 // NewCacheStore creates a new, independent CacheStore with the given config.
 // Unlike GetCache, each call returns a fresh instance — not a singleton.
 // The caller is responsible for calling Stop() when done.
-// Returns an error if cfg.DefaultTTL or cfg.CleanupInterval are zero or
-// negative; both would cause runtime panics or phantom entries.
-// MaxSize 0 is accepted and means "no entry-count limit" (only MaxMemoryMB
-// and TTL apply).
+// Returns an error if any required field is zero or negative.
 func NewCacheStore(cfg CacheConfig) (*CacheStore, error) {
 	if cfg.DefaultTTL <= 0 {
 		return nil, ErrInvalidTTL
 	}
 	if cfg.CleanupInterval <= 0 {
 		return nil, ErrInvalidCleanupInterval
+	}
+	if cfg.MaxSize <= 0 {
+		return nil, ErrInvalidMaxSize
+	}
+	if cfg.MaxMemoryMB <= 0 {
+		return nil, ErrInvalidMaxMemory
 	}
 	cs := &CacheStore{
 		data:        make(map[string]cacheEntry),
@@ -153,15 +160,30 @@ func (cs *CacheStore) Set(key string, value any, customTtl *time.Duration) error
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	// Check size limit and evict if necessary.
-	// MaxSize == 0 means "no entry-count limit"; only MaxMemoryMB / TTL apply.
-	if cs.config.MaxSize > 0 && len(cs.data) >= cs.config.MaxSize {
+	// ── Enforce entry-count limit ────────────────────────────────────────
+	for cs.config.MaxSize > 0 && len(cs.data) >= cs.config.MaxSize {
+		if len(cs.evictQ) == 0 {
+			break // defensive: heap empty but data remains — avoid infinite loop
+		}
 		cs.evictOldest()
 	}
 
 	now := time.Now()
 	expiresAt := now.Add(ttl)
 	entryBytes := estimateBytes(key, value)
+
+	// ── Enforce byte-level memory limit before insert ────────────────────
+	memLimit := int64(cs.config.MaxMemoryMB) * 1024 * 1024
+	for cs.bytesUsed.Load()+entryBytes > memLimit && len(cs.data) > 0 {
+		if len(cs.evictQ) == 0 {
+			break // defensive: heap empty — avoid infinite loop
+		}
+		cs.evictOldest()
+	}
+	// If the entry alone exceeds the budget, reject immediately.
+	if cs.bytesUsed.Load()+entryBytes > memLimit {
+		return ErrEntryTooLarge
+	}
 
 	// Store entry, adjusting byte accounting for updates vs new insertions.
 	// Preserve the original createdAt on updates so that hot (frequently
@@ -190,14 +212,18 @@ func (cs *CacheStore) Set(key string, value any, customTtl *time.Duration) error
 		cs.heapIndex[key] = heapEntry
 	}
 
-	// Enforce byte-level memory limit after inserting.
-	if cs.config.MaxMemoryMB > 0 {
-		cs.trimToMemoryLimitLocked()
-		// If the entry we just inserted was itself evicted (because it alone
-		// exceeds MaxMemoryMB), tell the caller rather than silently discarding.
-		if _, stillExists := cs.data[key]; !stillExists {
-			return ErrEntryTooLarge
-		}
+	// ── 90 % threshold warnings ──────────────────────────────────────────
+	sizeRatio := float64(len(cs.data)) / float64(cs.config.MaxSize)
+	if sizeRatio >= 0.9 {
+		logger.LogWarn("Cache nearing entry-count limit",
+			"size", len(cs.data), "maxSize", cs.config.MaxSize,
+			"usagePct", int(sizeRatio*100))
+	}
+	memUsed := cs.bytesUsed.Load()
+	if float64(memUsed) >= 0.9*float64(memLimit) {
+		logger.LogWarn("Cache nearing memory limit",
+			"bytesUsed", memUsed, "limitBytes", memLimit,
+			"usagePct", int(float64(memUsed)/float64(memLimit)*100))
 	}
 
 	cs.sets.Add(1)
@@ -530,8 +556,17 @@ func estimateBytes(key string, v any) int64 {
 		return base + int64(len(r))
 	case []byte:
 		return base + int64(len(r))
+	case bool:
+		return base + 1
+	case int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		float32, float64:
+		return base + 8
 	default:
-		// Unknown type: account for key + rough struct/pointer overhead.
+		// Unknown composite type: key + conservative fixed overhead.
+		// Only CachedResponse, string, []byte, and primitive types are
+		// estimated precisely. For accurate memory tracking, prefer
+		// storing one of those types.
 		return base + 64
 	}
 }
@@ -541,6 +576,8 @@ var (
 	ErrInvalidKey             = errors.New("invalid key: cannot be empty")
 	ErrInvalidTTL             = errors.New("invalid TTL: must be greater than zero")
 	ErrInvalidCleanupInterval = errors.New("invalid CleanupInterval: must be greater than zero")
+	ErrInvalidMaxSize         = errors.New("invalid MaxSize: must be greater than zero")
+	ErrInvalidMaxMemory       = errors.New("invalid MaxMemoryMB: must be greater than zero")
 	ErrEntryTooLarge          = errors.New("entry exceeds MaxMemoryMB limit and was evicted immediately")
 	ErrNotFound               = errors.New("key not found in cache")
 )

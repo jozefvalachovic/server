@@ -9,8 +9,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/jozefvalachovic/logger/v4"
 	"github.com/jozefvalachovic/server/response"
+
+	"github.com/jozefvalachovic/logger/v4"
 )
 
 // AuthScheme identifies the authentication scheme expected by the middleware.
@@ -54,6 +55,11 @@ type AuthConfig struct {
 	// Use it for audit logging, metrics, or brute-force detection.
 	// Called with the request and the error returned by Verify (nil when
 	// the credential was missing/malformed before Verify was called).
+	//
+	// Brute-force mitigation: the Auth middleware does not rate-limit failed
+	// attempts internally. Place the RateLimit middleware before Auth in the
+	// stack to bound attempts per client, or implement backoff logic inside
+	// OnAuthFailure. AuditAuthFailure is provided as a ready-to-use callback.
 	OnAuthFailure func(r *http.Request, err error)
 }
 
@@ -108,9 +114,14 @@ func Auth(cfg AuthConfig) func(http.Handler) http.Handler {
 	if cfg.Realm == "" {
 		cfg.Realm = "API"
 	}
-	skipPaths := make(map[string]bool, len(cfg.SkipPaths))
+	skipExact := make(map[string]bool, len(cfg.SkipPaths))
+	var skipPrefixes []string
 	for _, p := range cfg.SkipPaths {
-		skipPaths[p] = true
+		if len(p) > 0 && p[len(p)-1] == '/' {
+			skipPrefixes = append(skipPrefixes, p)
+		} else {
+			skipExact[p] = true
+		}
 	}
 
 	wwwAuth := string(cfg.Scheme) + ` realm="` + cfg.Realm + `"`
@@ -120,12 +131,12 @@ func Auth(cfg AuthConfig) func(http.Handler) http.Handler {
 			// SkipPaths supports both exact-match and prefix-match (trailing '/').
 			// "/health" matches only "/health"; "/admin/" matches "/admin/metrics".
 			path := r.URL.Path
-			if skipPaths[path] {
+			if skipExact[path] {
 				next.ServeHTTP(w, r)
 				return
 			}
-			for sp := range skipPaths {
-				if len(sp) > 0 && sp[len(sp)-1] == '/' && strings.HasPrefix(path, sp) {
+			for _, sp := range skipPrefixes {
+				if strings.HasPrefix(path, sp) {
 					next.ServeHTTP(w, r)
 					return
 				}

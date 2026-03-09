@@ -11,6 +11,7 @@ func newTestStore(t *testing.T) *CacheStore {
 		MaxSize:         100,
 		DefaultTTL:      time.Minute,
 		CleanupInterval: time.Hour,
+		MaxMemoryMB:     64,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -20,14 +21,24 @@ func newTestStore(t *testing.T) *CacheStore {
 }
 
 func TestNewCacheStore_InvalidConfig(t *testing.T) {
-	_, err := NewCacheStore(CacheConfig{DefaultTTL: 0, CleanupInterval: time.Second})
+	_, err := NewCacheStore(CacheConfig{DefaultTTL: 0, CleanupInterval: time.Second, MaxSize: 10, MaxMemoryMB: 1})
 	if err != ErrInvalidTTL {
 		t.Fatalf("want ErrInvalidTTL, got %v", err)
 	}
 
-	_, err = NewCacheStore(CacheConfig{DefaultTTL: time.Second, CleanupInterval: 0})
+	_, err = NewCacheStore(CacheConfig{DefaultTTL: time.Second, CleanupInterval: 0, MaxSize: 10, MaxMemoryMB: 1})
 	if err != ErrInvalidCleanupInterval {
 		t.Fatalf("want ErrInvalidCleanupInterval, got %v", err)
+	}
+
+	_, err = NewCacheStore(CacheConfig{DefaultTTL: time.Second, CleanupInterval: time.Second, MaxSize: 0, MaxMemoryMB: 1})
+	if err != ErrInvalidMaxSize {
+		t.Fatalf("want ErrInvalidMaxSize, got %v", err)
+	}
+
+	_, err = NewCacheStore(CacheConfig{DefaultTTL: time.Second, CleanupInterval: time.Second, MaxSize: 10, MaxMemoryMB: 0})
+	if err != ErrInvalidMaxMemory {
+		t.Fatalf("want ErrInvalidMaxMemory, got %v", err)
 	}
 }
 
@@ -107,6 +118,7 @@ func TestEviction(t *testing.T) {
 		MaxSize:         3,
 		DefaultTTL:      time.Minute,
 		CleanupInterval: time.Hour,
+		MaxMemoryMB:     64,
 	})
 	if err != nil {
 		t.Fatal(err)

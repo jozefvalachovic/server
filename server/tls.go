@@ -192,6 +192,10 @@ func (r *CertReloader) filesChanged() bool {
 	return changed
 }
 
+// pollLoop uses time-based file polling (os.Stat) rather than OS-specific
+// file-watch APIs (e.g. fsnotify/inotify) to keep the implementation simple
+// and portable across all platforms. The default 30 s interval is a good
+// balance between responsiveness and minimal syscall overhead.
 func (r *CertReloader) pollLoop(interval time.Duration) {
 	defer close(r.done)
 	ticker := time.NewTicker(interval)

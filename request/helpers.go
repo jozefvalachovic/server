@@ -8,6 +8,11 @@ import (
 	"strings"
 )
 
+// Deprecated: GetIPAddress trusts X-Forwarded-For unconditionally, which is
+// trivially spoofable. Use middleware.IPFilter with TrustedProxies for
+// security-sensitive IP resolution (right-to-left XFF walk). This function
+// is retained only for backward compatibility with non-security use cases.
+//
 // GetIPAddress retrieves the IP address from the HTTP request.
 // WARNING: X-Forwarded-For and X-Real-IP headers are set by the client and can be
 // spoofed unless they are stripped or validated at a trusted reverse proxy/load

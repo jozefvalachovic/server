@@ -49,6 +49,7 @@ func e2eServer(t *testing.T) (baseURL string, cleanup func()) {
 		DefaultTTL:      300 * time.Second,
 		CleanupInterval: 30 * time.Second,
 		MaxSize:         100,
+		MaxMemoryMB:     64,
 	}
 
 	store, err := routes.RegisterRoutes(mux, cacheConfig,

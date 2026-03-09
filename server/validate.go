@@ -7,9 +7,8 @@ import (
 
 // Validate checks for obviously incorrect values in HTTPServerConfig and
 // returns an aggregate error describing every problem found.
-// Call it before NewHTTPServer if you want early, structured feedback;
-// NewHTTPServer itself does not call Validate automatically so existing
-// callers are unaffected.
+// NewHTTPServer calls Validate automatically; callers may also invoke it
+// independently for early, structured feedback.
 func (c *HTTPServerConfig) Validate() error {
 	var errs []error
 
