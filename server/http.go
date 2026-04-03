@@ -41,6 +41,19 @@ type OTelBridgeConfig struct {
 	Handler slog.Handler
 }
 
+// initLoggerOnce and shutdownLoggerOnce are process-global singletons.
+// The logger is initialised exactly once per process by the first call to
+// initLogger (typically from the first NewHTTPServer or NewTCPServer). All
+// subsequent calls reuse that configuration; differing OTelBridge configs are
+// detected and warned about but not applied.
+//
+// Implications:
+//   - In production (one server per pod) this is the correct behaviour.
+//   - In test suites that construct multiple servers in the same process, only
+//     the first server's logger configuration takes effect. Use t.Setenv to
+//     control log levels if needed, but do not rely on per-test logger config.
+//   - shutdownLoggerOnce ensures logger buffers are drained exactly once
+//     during the first GracefulShutdown/ForceShutdown call.
 var (
 	initLoggerOnce sync.Once
 	initLoggerOTel *OTelBridgeConfig // first OTel config; used to detect conflicts
@@ -76,6 +89,8 @@ func initLogger(otel *OTelBridgeConfig) {
 	}
 }
 
+// shutdownLoggerOnce ensures logger.Shutdown is called exactly once per
+// process, even when multiple servers shut down concurrently or sequentially.
 var shutdownLoggerOnce sync.Once
 
 func shutdownLogger() {

@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -213,15 +214,17 @@ func (cs *CacheStore) Set(key string, value any, customTtl *time.Duration) error
 	}
 
 	// ── 90 % threshold warnings ──────────────────────────────────────────
+	// Logged at Trace level because this fires on every Set() above 90%
+	// capacity — normal operating state for a properly-sized cache.
 	sizeRatio := float64(len(cs.data)) / float64(cs.config.MaxSize)
 	if sizeRatio >= 0.9 {
-		logger.LogWarn("Cache nearing entry-count limit",
+		logger.LogTrace("Cache nearing entry-count limit",
 			"size", len(cs.data), "maxSize", cs.config.MaxSize,
 			"usagePct", int(sizeRatio*100))
 	}
 	memUsed := cs.bytesUsed.Load()
 	if float64(memUsed) >= 0.9*float64(memLimit) {
-		logger.LogWarn("Cache nearing memory limit",
+		logger.LogTrace("Cache nearing memory limit",
 			"bytesUsed", memUsed, "limitBytes", memLimit,
 			"usagePct", int(float64(memUsed)/float64(memLimit)*100))
 	}
@@ -447,6 +450,9 @@ func (cs *CacheStore) cleanupExpired() {
 		cs.size.Add(-int64(deleted))
 		cs.bytesUsed.Add(-expiredBytes)
 		cs.deletes.Add(int64(deleted))
+		// Reclaim excess heap capacity after batch eviction so the backing
+		// array does not retain its peak allocation indefinitely.
+		cs.evictQ = slices.Clip(cs.evictQ)
 	}
 	cs.mu.Unlock()
 
@@ -534,6 +540,8 @@ func (cs *CacheStore) trimToMemoryLimitLocked() {
 	for cs.bytesUsed.Load() > limit && len(cs.data) > 0 {
 		cs.evictOldest()
 	}
+	// Reclaim excess heap capacity after bulk eviction.
+	cs.evictQ = slices.Clip(cs.evictQ)
 }
 
 // estimateBytes returns a rough byte estimate for the given key-value pair.

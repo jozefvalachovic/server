@@ -426,7 +426,7 @@ func fetchDemo(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		response.APIErrorWriter(w, response.APIError[any]{
 			Code:    http.StatusBadGateway,
-			Error:   new("Fetch failed"),
+			Error:   response.ErrBadGateway,
 			Message: err.Error(),
 		})
 		return

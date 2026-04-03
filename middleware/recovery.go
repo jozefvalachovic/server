@@ -80,7 +80,7 @@ func Recovery(next http.Handler) http.Handler {
 					response.APIErrorWriter(w, response.APIError[any]{
 						Code:    http.StatusInternalServerError,
 						Data:    response.CreateEmptyData[any](),
-						Error:   new("Internal server error"),
+						Error:   response.ErrInternalServerLow,
 						Message: "An unexpected error occurred",
 						Details: "The request could not be completed due to an internal error",
 					})

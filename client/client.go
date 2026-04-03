@@ -291,10 +291,12 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 				req.Body = body
 			}
 			backoff := c.backoffDuration(attempt)
+			timer := time.NewTimer(backoff)
 			select {
 			case <-req.Context().Done():
+				timer.Stop()
 				return nil, req.Context().Err()
-			case <-time.After(backoff):
+			case <-timer.C:
 			}
 		}
 

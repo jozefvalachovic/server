@@ -9,7 +9,7 @@ func APIBadRequest(w http.ResponseWriter, message, details string) {
 	APIErrorWriter(w, APIError[any]{
 		Code:    http.StatusBadRequest,
 		Data:    CreateEmptyData[any](),
-		Error:   new("Bad Request"),
+		Error:   ErrBadRequest,
 		Message: message,
 		Details: details,
 	})
@@ -20,7 +20,7 @@ func APIUnauthorized(w http.ResponseWriter, message string) {
 	apiError := APIError[any]{
 		Code:    http.StatusUnauthorized,
 		Data:    CreateEmptyData[any](),
-		Error:   new("Unauthorized"),
+		Error:   ErrUnauthorized,
 		Message: message,
 	}
 
@@ -32,7 +32,7 @@ func APIForbidden(w http.ResponseWriter, message string) {
 	apiError := APIError[any]{
 		Code:    http.StatusForbidden,
 		Data:    CreateEmptyData[any](),
-		Error:   new("Forbidden"),
+		Error:   ErrForbidden,
 		Message: message,
 	}
 
@@ -44,7 +44,7 @@ func APINotFound(w http.ResponseWriter, message string) {
 	APIErrorWriter(w, APIError[any]{
 		Code:    http.StatusNotFound,
 		Data:    CreateEmptyData[any](),
-		Error:   new("Not Found"),
+		Error:   ErrNotFound,
 		Message: message,
 	})
 }
@@ -54,7 +54,7 @@ func APIConflict(w http.ResponseWriter, message string) {
 	APIErrorWriter(w, APIError[any]{
 		Code:    http.StatusConflict,
 		Data:    CreateEmptyData[any](),
-		Error:   new("Conflict"),
+		Error:   ErrConflict,
 		Message: message,
 	})
 }
@@ -64,7 +64,7 @@ func APIInternalError(w http.ResponseWriter, message string) {
 	APIErrorWriter(w, APIError[any]{
 		Code:    http.StatusInternalServerError,
 		Data:    CreateEmptyData[any](),
-		Error:   new("Internal Server Error"),
+		Error:   ErrInternalServer,
 		Message: message,
 	})
 }
@@ -74,7 +74,7 @@ func APIServiceUnavailable(w http.ResponseWriter, message string) {
 	APIErrorWriter(w, APIError[any]{
 		Code:    http.StatusServiceUnavailable,
 		Data:    CreateEmptyData[any](),
-		Error:   new("Service Unavailable"),
+		Error:   ErrServiceUnavailable,
 		Message: message,
 	})
 }

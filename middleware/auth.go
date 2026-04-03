@@ -150,7 +150,7 @@ func Auth(cfg AuthConfig) func(http.Handler) http.Handler {
 				w.Header().Set("WWW-Authenticate", wwwAuth)
 				response.APIErrorWriter(w, response.APIError[any]{
 					Code:    http.StatusUnauthorized,
-					Error:   new("Unauthorized"),
+					Error:   response.ErrUnauthorized,
 					Message: "Missing or malformed credentials.",
 				})
 				return
@@ -164,7 +164,7 @@ func Auth(cfg AuthConfig) func(http.Handler) http.Handler {
 				w.Header().Set("WWW-Authenticate", wwwAuth)
 				response.APIErrorWriter(w, response.APIError[any]{
 					Code:    http.StatusUnauthorized,
-					Error:   new("Unauthorized"),
+					Error:   response.ErrUnauthorized,
 					Message: "Invalid credentials.",
 				})
 				return

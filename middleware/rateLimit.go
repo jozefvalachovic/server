@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"hash/maphash"
 	"net"
 	"net/http"
 	"sync"
@@ -11,10 +12,89 @@ import (
 	"github.com/jozefvalachovic/server/response"
 )
 
+// rateLimitShards is the number of independent map shards used by the HTTP
+// rate limiter. 16 shards reduce lock contention by ~16× under high-concurrency
+// workloads with many distinct client IPs while keeping memory overhead minimal.
+const rateLimitShards = 16
+
 type rateBucket struct {
 	mu       sync.Mutex
 	tokens   float64
 	lastSeen atomic.Int64 // UnixNano; read atomically by cleanup without locking mu
+}
+
+// rateShard is one independent partition of the bucket map, protected by its
+// own RWMutex so that operations on different shards never contend.
+type rateShard struct {
+	mu      sync.RWMutex
+	buckets map[string]*rateBucket
+}
+
+// shardedBuckets distributes client keys across rateLimitShards independent
+// maps, selected by hashing the key. This reduces mutex contention compared
+// to a single global RWMutex when a pod handles thousands of unique IPs/sec.
+type shardedBuckets struct {
+	shards [rateLimitShards]rateShard
+	seed   maphash.Seed
+}
+
+func newShardedBuckets() *shardedBuckets {
+	sb := &shardedBuckets{seed: maphash.MakeSeed()}
+	for i := range sb.shards {
+		sb.shards[i].buckets = make(map[string]*rateBucket)
+	}
+	return sb
+}
+
+func (sb *shardedBuckets) shard(key string) *rateShard {
+	var h maphash.Hash
+	h.SetSeed(sb.seed)
+	h.WriteString(key)
+	return &sb.shards[h.Sum64()%rateLimitShards]
+}
+
+func (sb *shardedBuckets) getOrCreate(key string, burst float64, now time.Time) *rateBucket {
+	s := sb.shard(key)
+	s.mu.RLock()
+	b, ok := s.buckets[key]
+	s.mu.RUnlock()
+	if ok {
+		return b
+	}
+	s.mu.Lock()
+	b, ok = s.buckets[key]
+	if !ok {
+		b = &rateBucket{tokens: burst}
+		b.lastSeen.Store(now.UnixNano())
+		s.buckets[key] = b
+	}
+	s.mu.Unlock()
+	return b
+}
+
+// cleanup iterates all shards and removes idle entries. Each shard is locked
+// independently so live traffic on other shards is never blocked.
+func (sb *shardedBuckets) cleanup(idleTimeout time.Duration) {
+	now := time.Now()
+	for i := range sb.shards {
+		s := &sb.shards[i]
+		s.mu.RLock()
+		var stale []string
+		for key, b := range s.buckets {
+			idle := now.Sub(time.Unix(0, b.lastSeen.Load()))
+			if idle > idleTimeout {
+				stale = append(stale, key)
+			}
+		}
+		s.mu.RUnlock()
+		if len(stale) > 0 {
+			s.mu.Lock()
+			for _, key := range stale {
+				delete(s.buckets, key)
+			}
+			s.mu.Unlock()
+		}
+	}
 }
 
 // HTTPRateLimitConfig configures the HTTPRateLimit middleware.
@@ -95,17 +175,14 @@ func HTTPRateLimit(cfgs ...HTTPRateLimitConfig) func(http.Handler) http.Handler 
 		cfg.KeyFunc = remoteIP
 	}
 
-	var (
-		mu      sync.RWMutex
-		buckets = make(map[string]*rateBucket)
-	)
+	buckets := newShardedBuckets()
 
 	burst := float64(cfg.Burst)
 	rate := cfg.RequestsPerSecond
 
 	// Background goroutine removes idle buckets to prevent unbounded memory growth.
-	// Two-phase: collect stale keys under RLock, delete under a brief Lock,
-	// so the cleanup sweep does not block live requests for its full duration.
+	// Each shard is locked independently so cleanup never blocks live traffic
+	// on other shards.
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
 	if cfg.Context != nil {
 		cleanupCtx, cleanupCancel = context.WithCancel(cfg.Context)
@@ -120,23 +197,7 @@ func HTTPRateLimit(cfgs ...HTTPRateLimitConfig) func(http.Handler) http.Handler 
 			case <-cleanupCtx.Done():
 				return
 			case <-ticker.C:
-				now := time.Now()
-				mu.RLock()
-				var stale []string
-				for key, b := range buckets {
-					idle := now.Sub(time.Unix(0, b.lastSeen.Load()))
-					if idle > cfg.IdleTimeout {
-						stale = append(stale, key)
-					}
-				}
-				mu.RUnlock()
-				if len(stale) > 0 {
-					mu.Lock()
-					for _, key := range stale {
-						delete(buckets, key)
-					}
-					mu.Unlock()
-				}
+				buckets.cleanup(cfg.IdleTimeout)
 			}
 		}
 	}()
@@ -146,19 +207,7 @@ func HTTPRateLimit(cfgs ...HTTPRateLimitConfig) func(http.Handler) http.Handler 
 			key := cfg.KeyFunc(r)
 			now := time.Now()
 
-			mu.RLock()
-			b, ok := buckets[key]
-			mu.RUnlock()
-			if !ok {
-				mu.Lock()
-				b, ok = buckets[key]
-				if !ok {
-					b = &rateBucket{tokens: burst}
-					b.lastSeen.Store(now.UnixNano())
-					buckets[key] = b
-				}
-				mu.Unlock()
-			}
+			b := buckets.getOrCreate(key, burst, now)
 
 			b.mu.Lock()
 			elapsed := now.Sub(time.Unix(0, b.lastSeen.Load())).Seconds()
@@ -173,7 +222,7 @@ func HTTPRateLimit(cfgs ...HTTPRateLimitConfig) func(http.Handler) http.Handler 
 			if !allow {
 				response.APIErrorWriter(w, response.APIError[any]{
 					Code:    cfg.StatusCode,
-					Error:   new("Too Many Requests"),
+					Error:   response.ErrTooManyRequests,
 					Message: "Rate limit exceeded. Please slow down.",
 				})
 				return

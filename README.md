@@ -468,7 +468,7 @@ middleware.TCPRateLimit(middleware.TCPRateLimitConfig{
 | `IdleTimeout`          | `time.Duration`         | 5 min                            | Bucket idle time before eviction      |
 | `Context`              | `context.Context`       | background                       | Cancel to stop cleanup goroutine      |
 
-Both rate limiters use per-key token buckets with automatic two-phase cleanup (collect stale under RLock, delete under Lock).
+Both rate limiters use per-key token buckets with automatic background cleanup. The HTTP rate limiter partitions buckets across 16 lock-sharded segments (keyed via `maphash`) so high-concurrency workloads rarely contend on the same lock.
 
 ### IP filter
 
@@ -833,6 +833,26 @@ if apiErr != nil {
 | `SSEWriter[T]`             | Server-Sent Events writer with heartbeats and context awareness        |
 | `HeartbeatData`            | SSE heartbeat payload (`type`, `timestamp`, `sent`)                    |
 
+**Sentinel error pointers:**
+
+Pre-allocated `*string` pointers for common error labels. Using these avoids a heap allocation per error response, reducing GC pressure under sustained rejection traffic (rate limiting, auth failures, etc.).
+
+```go
+response.ErrBadRequest         // "Bad Request"
+response.ErrUnauthorized       // "Unauthorized"
+response.ErrForbidden          // "Forbidden"
+response.ErrNotFound           // "Not Found"
+response.ErrMethodNotAllowed   // "Method Not Allowed"
+response.ErrConflict           // "Conflict"
+response.ErrTooManyRequests    // "Too Many Requests"
+response.ErrInternalServer     // "Internal Server Error"
+response.ErrGatewayTimeout     // "Gateway Timeout"
+response.ErrBadGateway         // "Fetch failed"
+response.ErrServiceUnavailable // "Service Unavailable"
+```
+
+The error shortcut functions (`APIBadRequest`, `APIUnauthorized`, etc.) and middleware already use these sentinels. Custom handlers can reference them to avoid allocating duplicate strings.
+
 `ValidateAndDecode[T]` rejects unknown JSON fields, nil/empty bodies, and bodies exceeding the `MaxBytesReader` limit (returns 413).
 
 ---
@@ -1069,7 +1089,7 @@ When `Admin` is set, `NewHTTPServer` creates a `Collector`, registers all admin 
 | `/metrics/auth` | Login page for the metrics section           |
 | `/cache/auth`   | Login page for the cache section             |
 
-Session-based HMAC-SHA256 auth with 8-hour TTL cookie. Login attempts are rate-limited to 5 per IP address within a 15-minute window.
+Session-based HMAC-SHA256 auth with 8-hour TTL cookie. Login attempts are rate-limited to 5 per IP address within a 15-minute window. A background janitor goroutine sweeps stale entries every 15 minutes to prevent unbounded memory growth from rotated source IPs.
 
 **Standalone usage** (without `NewHTTPServer`):
 

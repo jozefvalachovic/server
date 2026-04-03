@@ -22,9 +22,21 @@ type CacheConfig = cache.CacheConfig
 // registrars never need to receive or forward the *cache.CacheStore pointer.
 // Protected by activeStoreMu against concurrent access (e.g. parallel tests).
 //
-// IMPORTANT: CachedRouteHandler must only be called synchronously inside a
-// RegisterRouteRegistrar callback (while RegisterRoutes holds the lock).
-// Calling it from a goroutine spawned by a registrar may read a stale store.
+// This is a process-scoped singleton by design. It works correctly for the
+// standard Kubernetes deployment model (one mux per pod) and keeps the route
+// registration API simple: registrars receive only an *http.ServeMux and call
+// CachedRouteHandler without threading a store through every layer.
+//
+// Limitations:
+//   - Only one active cache store exists at a time. Calling RegisterRoutes a
+//     second time replaces the store; earlier registrars that captured the old
+//     store via CachedRouteHandler continue to reference it.
+//   - Two independent mux trees with different cache stores in the same process
+//     (e.g. parallel test cases) are not supported. In tests, run such cases
+//     sequentially or pass the store explicitly via middleware.HTTPCacheConfig.
+//   - CachedRouteHandler must only be called synchronously inside a
+//     RegisterRouteRegistrar callback (while RegisterRoutes holds the lock).
+//     Calling it from a goroutine spawned by a registrar may read a stale store.
 var (
 	activeStore   *cache.CacheStore
 	activeStoreMu sync.RWMutex
@@ -133,7 +145,7 @@ func RouteHandler(routes Routes) http.HandlerFunc {
 			w.Header().Set("Allow", allow)
 			response.APIErrorWriter(w, response.APIError[any]{
 				Code:    http.StatusMethodNotAllowed,
-				Error:   new("Method Not Allowed"),
+				Error:   response.ErrMethodNotAllowed,
 				Message: "Method not allowed for this endpoint",
 			})
 		}

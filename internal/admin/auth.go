@@ -81,6 +81,9 @@ func isAuthenticated(r *http.Request) bool {
 }
 
 // setSessionCookie writes a signed session cookie to the response.
+// Cookie path is "/" because admin routes span multiple top-level prefixes
+// (/metrics/, /cache/, /admin/*) with no common ancestor. The HttpOnly +
+// SameSite=Lax flags prevent client-side JS and cross-site access.
 func setSessionCookie(w http.ResponseWriter, r *http.Request, name, secret string) {
 	token := makeToken(name, secret)
 	http.SetCookie(w, &http.Cookie{
@@ -95,6 +98,9 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, name, secret strin
 }
 
 // clearSessionCookie expires the admin session cookie.
+// Cookie path remains "/" because admin routes span /metrics/, /cache/, and
+// /admin/* — there is no single common prefix. The HttpOnly + SameSite=Lax
+// flags prevent client-side JS and cross-site access.
 func clearSessionCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     cookieName,
@@ -135,6 +141,33 @@ var loginLimiter struct {
 
 func init() {
 	loginLimiter.attempts = make(map[string][]time.Time)
+
+	// Background janitor evicts stale IPs every loginWindow so that rotated
+	// source addresses do not accumulate indefinitely in memory.
+	go func() {
+		ticker := time.NewTicker(loginWindow)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			cutoff := now.Add(-loginWindow)
+			loginLimiter.mu.Lock()
+			for ip, times := range loginLimiter.attempts {
+				n := 0
+				for _, t := range times {
+					if t.After(cutoff) {
+						times[n] = t
+						n++
+					}
+				}
+				if n == 0 {
+					delete(loginLimiter.attempts, ip)
+				} else {
+					loginLimiter.attempts[ip] = times[:n]
+				}
+			}
+			loginLimiter.mu.Unlock()
+		}
+	}()
 }
 
 // loginRateOK returns true if the IP has not exceeded the login attempt limit.

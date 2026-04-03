@@ -213,7 +213,7 @@ func isTrustedProxy(ip net.IP, proxyNets []*net.IPNet) bool {
 func writeForbidden(w http.ResponseWriter) {
 	response.APIErrorWriter(w, response.APIError[any]{
 		Code:    http.StatusForbidden,
-		Error:   new("Forbidden"),
+		Error:   response.ErrForbidden,
 		Message: "Access denied.",
 	})
 }

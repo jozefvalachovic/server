@@ -139,7 +139,7 @@ func logoutHandler(authURL string) http.HandlerFunc {
 	}
 }
 
-func metricsPageHandler(cfg Config, w http.ResponseWriter, r *http.Request) {
+func metricsPageHandler(cfg Config, w http.ResponseWriter, _ *http.Request) {
 	if cfg.Collector == nil {
 		http.Error(w, "metrics collector not configured", http.StatusServiceUnavailable)
 		return
@@ -192,7 +192,7 @@ func metricsPageHandler(cfg Config, w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func cachePageHandler(cfg Config, w http.ResponseWriter, r *http.Request) {
+func cachePageHandler(cfg Config, w http.ResponseWriter, _ *http.Request) {
 	if cfg.Store == nil {
 		http.Error(w, "cache store not configured", http.StatusServiceUnavailable)
 		return
@@ -263,7 +263,7 @@ func cacheDeleteHandler(cfg Config, w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func cacheFlushHandler(cfg Config, w http.ResponseWriter, r *http.Request) {
+func cacheFlushHandler(cfg Config, w http.ResponseWriter, _ *http.Request) {
 	if cfg.Store == nil {
 		http.Error(w, "cache store not configured", http.StatusServiceUnavailable)
 		return

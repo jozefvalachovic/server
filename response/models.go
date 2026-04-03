@@ -53,3 +53,25 @@ type APIError[T any] struct {
 	Message string  `json:"message"`
 	Details string  `json:"details,omitempty"`
 }
+
+// ── Error string sentinels ───────────────────────────────────────────────────
+// Pre-allocated *string pointers for common error labels. Using these instead
+// of new("...") on every request avoids a heap allocation per error response,
+// reducing GC pressure under sustained rejection (rate limiting, auth failures).
+
+func ptr(s string) *string { return &s }
+
+var (
+	ErrBadRequest         = ptr("Bad Request")
+	ErrUnauthorized       = ptr("Unauthorized")
+	ErrForbidden          = ptr("Forbidden")
+	ErrNotFound           = ptr("Not Found")
+	ErrMethodNotAllowed   = ptr("Method Not Allowed")
+	ErrConflict           = ptr("Conflict")
+	ErrTooManyRequests    = ptr("Too Many Requests")
+	ErrInternalServer     = ptr("Internal Server Error")
+	ErrInternalServerLow  = ptr("Internal server error")
+	ErrGatewayTimeout     = ptr("Gateway Timeout")
+	ErrBadGateway         = ptr("Fetch failed")
+	ErrServiceUnavailable = ptr("Service Unavailable")
+)

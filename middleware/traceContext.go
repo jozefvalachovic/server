@@ -17,7 +17,6 @@ const (
 	traceparentVersion = "00"
 	traceIDLen         = 16 // 16 bytes = 32 hex chars
 	spanIDLen          = 8  // 8 bytes  = 16 hex chars
-	traceFlagsLen      = 1  // 1 byte   = 2 hex chars
 )
 
 // TraceContextConfig configures the TraceContext middleware.

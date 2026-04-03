@@ -88,7 +88,7 @@ func Timeout(cfgs ...TimeoutConfig) func(http.Handler) http.Handler {
 						if tw.timeout() {
 							response.APIErrorWriter(w, response.APIError[any]{
 								Code:    http.StatusInternalServerError,
-								Error:   new("Internal server error"),
+								Error:   response.ErrInternalServerLow,
 								Message: "An unexpected error occurred",
 							})
 						}
@@ -108,7 +108,7 @@ func Timeout(cfgs ...TimeoutConfig) func(http.Handler) http.Handler {
 				if tw.timeout() {
 					response.APIErrorWriter(w, response.APIError[any]{
 						Code:    http.StatusGatewayTimeout,
-						Error:   new("Gateway Timeout"),
+						Error:   response.ErrGatewayTimeout,
 						Message: errMsg,
 					})
 				}
