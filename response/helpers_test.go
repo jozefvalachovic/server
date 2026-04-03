@@ -33,6 +33,7 @@ func TestValidateAndDecode_NilBody(t *testing.T) {
 	_, apiErr := ValidateAndDecode[payload](req)
 	if apiErr == nil {
 		t.Fatal("expected an error for nil body")
+		return
 	}
 	if apiErr.Code != http.StatusBadRequest {
 		t.Fatalf("want 400, got %d", apiErr.Code)
@@ -47,6 +48,7 @@ func TestValidateAndDecode_EmptyBody(t *testing.T) {
 	_, apiErr := ValidateAndDecode[payload](req)
 	if apiErr == nil {
 		t.Fatal("expected an error for empty body")
+		return
 	}
 	if apiErr.Code != http.StatusBadRequest {
 		t.Fatalf("want 400, got %d", apiErr.Code)
@@ -61,6 +63,7 @@ func TestValidateAndDecode_InvalidJSON(t *testing.T) {
 	_, apiErr := ValidateAndDecode[payload](req)
 	if apiErr == nil {
 		t.Fatal("expected an error for invalid JSON")
+		return
 	}
 	if apiErr.Code != http.StatusBadRequest {
 		t.Fatalf("want 400, got %d", apiErr.Code)
@@ -78,6 +81,7 @@ func TestValidateAndDecode_ExtraFieldsRejected(t *testing.T) {
 	_, apiErr := ValidateAndDecode[payload](req)
 	if apiErr == nil {
 		t.Fatal("expected error for unknown field, got nil")
+		return
 	}
 	if apiErr.Code != http.StatusBadRequest {
 		t.Fatalf("want 400, got %d", apiErr.Code)
@@ -88,6 +92,7 @@ func TestCreateEmptyData_SliceIsNotNil(t *testing.T) {
 	result := CreateEmptyData[[]string]()
 	if result == nil {
 		t.Fatal("result pointer must not be nil")
+		return
 	}
 	if *result == nil {
 		t.Fatal("slice must be initialised (not nil)")
@@ -98,6 +103,7 @@ func TestCreateEmptyData_MapIsNotNil(t *testing.T) {
 	result := CreateEmptyData[map[string]int]()
 	if result == nil {
 		t.Fatal("result pointer must not be nil")
+		return
 	}
 	if *result == nil {
 		t.Fatal("map must be initialised (not nil)")
@@ -109,6 +115,7 @@ func TestCreateEmptyData_StructPointerIsInitialised(t *testing.T) {
 	result := CreateEmptyData[*inner]()
 	if result == nil {
 		t.Fatal("result must not be nil")
+		return
 	}
 	if *result == nil {
 		t.Fatal("pointer inside result must be initialised")

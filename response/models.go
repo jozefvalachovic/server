@@ -59,19 +59,17 @@ type APIError[T any] struct {
 // of new("...") on every request avoids a heap allocation per error response,
 // reducing GC pressure under sustained rejection (rate limiting, auth failures).
 
-func ptr(s string) *string { return &s }
-
 var (
-	ErrBadRequest         = ptr("Bad Request")
-	ErrUnauthorized       = ptr("Unauthorized")
-	ErrForbidden          = ptr("Forbidden")
-	ErrNotFound           = ptr("Not Found")
-	ErrMethodNotAllowed   = ptr("Method Not Allowed")
-	ErrConflict           = ptr("Conflict")
-	ErrTooManyRequests    = ptr("Too Many Requests")
-	ErrInternalServer     = ptr("Internal Server Error")
-	ErrInternalServerLow  = ptr("Internal server error")
-	ErrGatewayTimeout     = ptr("Gateway Timeout")
-	ErrBadGateway         = ptr("Fetch failed")
-	ErrServiceUnavailable = ptr("Service Unavailable")
+	ErrBadRequest         = new("Bad Request")
+	ErrUnauthorized       = new("Unauthorized")
+	ErrForbidden          = new("Forbidden")
+	ErrNotFound           = new("Not Found")
+	ErrMethodNotAllowed   = new("Method Not Allowed")
+	ErrConflict           = new("Conflict")
+	ErrTooManyRequests    = new("Too Many Requests")
+	ErrInternalServer     = new("Internal Server Error")
+	ErrInternalServerLow  = new("Internal server error")
+	ErrGatewayTimeout     = new("Gateway Timeout")
+	ErrBadGateway         = new("Fetch failed")
+	ErrServiceUnavailable = new("Service Unavailable")
 )
