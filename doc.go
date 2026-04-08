@@ -64,4 +64,27 @@
 // Watch additional directories:
 //
 //	watch.Init(watch.Config{ExtraDirs: []string{"../shared"}})
+//
+// # Middleware ordering
+//
+// NewHTTPServer assembles a fixed middleware stack. Built-in middleware always
+// executes in this order (outermost first):
+//
+//  1. Logger         — access logging + optional audit (true outermost layer)
+//  2. Recovery       — panic → 500 + stack trace
+//  3. Security       — security response headers
+//  4. IPFilter       — IP allowlist / blocklist         (if configured)
+//  5. RequestSize    — max body size enforcement
+//  6. RateLimit      — per-client token-bucket limiting (if configured)
+//  7. CORS           — cross-origin headers             (if configured)
+//  8. RequestID      — inject / propagate request IDs
+//  9. TraceContext   — W3C traceparent / tracestate
+//  10. Timeout       — per-request handler deadline
+//  11. Compress      — gzip content encoding            (if configured)
+//  12. Admin         — admin metrics collector           (if configured)
+//  13. Custom        — HTTPServerConfig.Middlewares (index 0 executes first)
+//     → Handler mux
+//
+// Custom middleware passed via Middlewares runs after all built-in layers and
+// before the handler. Index 0 executes first.
 package server

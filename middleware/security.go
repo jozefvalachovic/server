@@ -19,7 +19,6 @@ var staticHeaders = [...]struct{ k, v string }{
 	{"Permissions-Policy", "geolocation=(), microphone=(), camera=()"},
 	{"Cross-Origin-Opener-Policy", "same-origin"},
 	{"Cross-Origin-Resource-Policy", "same-origin"},
-	{"Server", "server"},
 }
 
 const hstsValue = "max-age=31536000; includeSubDomains; preload"

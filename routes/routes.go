@@ -1,7 +1,9 @@
 package routes
 
 import (
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 
@@ -132,11 +134,7 @@ type Routes map[string]http.HandlerFunc
 // provided routes map so that 405 paths incur no per-request allocations.
 func RouteHandler(routes Routes) http.HandlerFunc {
 	// Pre-build sorted Allow string once (RFC 7231 §6.5.5).
-	methods := make([]string, 0, len(routes))
-	for method := range routes {
-		methods = append(methods, method)
-	}
-	allow := strings.Join(methods, ", ")
+	allow := strings.Join(slices.Sorted(maps.Keys(routes)), ", ")
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		if handler, exists := routes[r.Method]; exists {

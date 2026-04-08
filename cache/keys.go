@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"maps"
 	"net/url"
 	"slices"
 	"strings"
@@ -44,11 +45,7 @@ func sortedQuery(rawQuery string) string {
 		return rawQuery
 	}
 
-	keys := make([]string, 0, len(params))
-	for k := range params {
-		keys = append(keys, k)
-	}
-	slices.Sort(keys)
+	keys := slices.Sorted(maps.Keys(params))
 
 	pairs := make([]string, 0, len(params))
 	for _, k := range keys {

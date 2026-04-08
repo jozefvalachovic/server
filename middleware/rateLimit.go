@@ -187,7 +187,6 @@ func HTTPRateLimit(cfgs ...HTTPRateLimitConfig) func(http.Handler) http.Handler 
 	if cfg.Context != nil {
 		cleanupCtx, cleanupCancel = context.WithCancel(cfg.Context)
 	}
-	_ = cleanupCancel // held for Stop(); also released when parent ctx cancels
 	go func() {
 		defer cleanupCancel()
 		ticker := time.NewTicker(cfg.CleanupInterval)
@@ -337,7 +336,6 @@ func TCPRateLimit(cfgs ...TCPRateLimitConfig) func(func(net.Conn)) func(net.Conn
 	if cfg.Context != nil {
 		tcpCleanupCtx, tcpCleanupCancel = context.WithCancel(cfg.Context)
 	}
-	_ = tcpCleanupCancel
 	go func() {
 		defer tcpCleanupCancel()
 		ticker := time.NewTicker(cfg.CleanupInterval)

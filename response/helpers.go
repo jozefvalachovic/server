@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"reflect"
+	"sync"
 )
 
 // ValidateAndDecode validates and decodes request body
@@ -44,8 +45,26 @@ func ValidateAndDecode[T any](r *http.Request) (T, *APIError[T]) {
 	return obj, nil
 }
 
+// emptyDataCache caches the initialized empty value per reflect.Type so that
+// CreateEmptyData avoids repeated reflect-based initialization on every error
+// response. The cache stores only pointers to zero-valued or initialised types.
+var emptyDataCache sync.Map // reflect.Type → *T
+
 // CreateEmptyData creates an empty data structure based on the type T.
 func CreateEmptyData[T any]() *T {
+	t := reflect.TypeFor[T]()
+
+	if cached, ok := emptyDataCache.Load(t); ok {
+		return cached.(*T)
+	}
+
+	result := createEmptyDataSlow[T]()
+	emptyDataCache.Store(t, result)
+	return result
+}
+
+// createEmptyDataSlow performs the reflect-based initialization once per type.
+func createEmptyDataSlow[T any]() *T {
 	var result T
 
 	// Fast path: interface types (T=any) — nil is correct for JSON.

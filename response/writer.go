@@ -1,9 +1,9 @@
 package response
 
 import (
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"hash/fnv"
 	"net/http"
 	"strings"
 
@@ -187,8 +187,12 @@ func APIResponseWriterWithETag[T any](w http.ResponseWriter, r *http.Request, da
 		return
 	}
 
-	hash := sha256.Sum256(body)
-	etag := `"` + hex.EncodeToString(hash[:16]) + `"`
+	// ETag is a cache validator, not a security mechanism, so a fast
+	// non-cryptographic hash (FNV-1a 128-bit) is used instead of SHA-256
+	// for significantly lower per-request overhead.
+	h := fnv.New128a()
+	h.Write(body)
+	etag := `"` + hex.EncodeToString(h.Sum(nil)) + `"`
 
 	w.Header().Set("ETag", etag)
 

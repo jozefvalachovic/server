@@ -3,6 +3,7 @@ package admin
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"net"
@@ -46,7 +47,7 @@ func validateToken(token, wantName, secret string) bool {
 		return false
 	}
 	name, ts, mac := parts[0], parts[1], parts[2]
-	if name != wantName {
+	if subtle.ConstantTimeCompare([]byte(name), []byte(wantName)) != 1 {
 		return false
 	}
 	expected := signMAC(secret, name+"|"+ts)
@@ -137,37 +138,55 @@ const (
 var loginLimiter struct {
 	mu       sync.Mutex
 	attempts map[string][]time.Time
+	stopOnce sync.Once
+	stopCh   chan struct{}
 }
 
 func init() {
 	loginLimiter.attempts = make(map[string][]time.Time)
+	loginLimiter.stopCh = make(chan struct{})
 
 	// Background janitor evicts stale IPs every loginWindow so that rotated
 	// source addresses do not accumulate indefinitely in memory.
+	// The goroutine exits when StopLoginLimiter is called (e.g. during shutdown
+	// or in tests to prevent goroutine leaks).
 	go func() {
 		ticker := time.NewTicker(loginWindow)
 		defer ticker.Stop()
-		for range ticker.C {
-			now := time.Now()
-			cutoff := now.Add(-loginWindow)
-			loginLimiter.mu.Lock()
-			for ip, times := range loginLimiter.attempts {
-				n := 0
-				for _, t := range times {
-					if t.After(cutoff) {
-						times[n] = t
-						n++
+		for {
+			select {
+			case <-loginLimiter.stopCh:
+				return
+			case <-ticker.C:
+				now := time.Now()
+				cutoff := now.Add(-loginWindow)
+				loginLimiter.mu.Lock()
+				for ip, times := range loginLimiter.attempts {
+					n := 0
+					for _, t := range times {
+						if t.After(cutoff) {
+							times[n] = t
+							n++
+						}
+					}
+					if n == 0 {
+						delete(loginLimiter.attempts, ip)
+					} else {
+						loginLimiter.attempts[ip] = times[:n]
 					}
 				}
-				if n == 0 {
-					delete(loginLimiter.attempts, ip)
-				} else {
-					loginLimiter.attempts[ip] = times[:n]
-				}
+				loginLimiter.mu.Unlock()
 			}
-			loginLimiter.mu.Unlock()
 		}
 	}()
+}
+
+// StopLoginLimiter terminates the background login-rate-limit janitor.
+// Safe to call multiple times; subsequent calls are no-ops.
+func StopLoginLimiter() {
+	loginLimiter.stopOnce.Do(func() {
+		close(loginLimiter.stopCh)
+	})
 }
 
 // loginRateOK returns true if the IP has not exceeded the login attempt limit.

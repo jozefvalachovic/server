@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,6 +30,22 @@ type TimeoutConfig struct {
 	// ErrorMessage is the human-readable message included in the 504 response.
 	// Default: "Request timed out. Please try again."
 	ErrorMessage string
+
+	// SkipPaths lists exact URL paths (or prefix paths ending in '/') that are
+	// exempt from the timeout. Use this for SSE, WebSocket upgrade, or long-poll
+	// endpoints that are expected to exceed the default deadline.
+	//
+	// Alternatively, handlers that manage their own deadline can call
+	// context.WithTimeout directly and set TimeoutConfig.Timeout to 0 globally,
+	// but SkipPaths is preferred because it keeps the default protection for all
+	// other routes.
+	//
+	// Example:
+	//
+	//	middleware.Timeout(middleware.TimeoutConfig{
+	//	    SkipPaths: []string{"/events", "/stream/"},
+	//	})
+	SkipPaths []string
 }
 
 // Timeout enforces a per-request deadline on every handler in the chain.
@@ -38,6 +55,19 @@ type TimeoutConfig struct {
 // will terminate cleanly. If the handler writes any bytes before the deadline
 // fires, no 504 is injected (the response is already committed).
 //
+// # Streaming / SSE handlers
+//
+// Handlers that intentionally outlive the default timeout (SSE, long-poll,
+// WebSocket upgrade) should be listed in TimeoutConfig.SkipPaths so they
+// bypass the deadline. Alternatively, such handlers can manage their own
+// context.WithTimeout and the global timeout can be disabled by setting
+// Timeout to 0 — but SkipPaths is preferred to preserve protection on all
+// other routes.
+//
+// Note: when using SSE, ensure the handler sends heartbeats within the
+// server's IdleTimeout (default 30 s) to prevent the connection from being
+// closed by the HTTP server. See response.SSEWriter.SendHeartbeat.
+//
 // Example — default timeout (30 s):
 //
 //	middleware.Timeout()
@@ -45,6 +75,12 @@ type TimeoutConfig struct {
 // Example — custom timeout:
 //
 //	middleware.Timeout(middleware.TimeoutConfig{Timeout: 5 * time.Second})
+//
+// Example — skip SSE paths:
+//
+//	middleware.Timeout(middleware.TimeoutConfig{
+//	    SkipPaths: []string{"/events", "/stream/"},
+//	})
 func Timeout(cfgs ...TimeoutConfig) func(http.Handler) http.Handler {
 	cfg := TimeoutConfig{}
 	if len(cfgs) > 0 {
@@ -59,8 +95,32 @@ func Timeout(cfgs ...TimeoutConfig) func(http.Handler) http.Handler {
 	timeout := cfg.Timeout
 	errMsg := cfg.ErrorMessage
 
+	// Pre-compute skip sets for O(1) exact match and prefix scanning.
+	skipExact := make(map[string]bool, len(cfg.SkipPaths))
+	var skipPrefixes []string
+	for _, p := range cfg.SkipPaths {
+		if len(p) > 0 && p[len(p)-1] == '/' {
+			skipPrefixes = append(skipPrefixes, p)
+		} else {
+			skipExact[p] = true
+		}
+	}
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// SkipPaths bypass — no timeout applied.
+			path := r.URL.Path
+			if skipExact[path] {
+				next.ServeHTTP(w, r)
+				return
+			}
+			for _, sp := range skipPrefixes {
+				if strings.HasPrefix(path, sp) {
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+
 			ctx, cancel := context.WithTimeout(r.Context(), timeout)
 			defer cancel()
 

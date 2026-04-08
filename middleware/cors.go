@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jozefvalachovic/logger/v4"
 )
 
 // CORSConfig configures the CORS middleware.
@@ -135,8 +137,11 @@ func CORS(cfgs ...CORSConfig) func(http.Handler) http.Handler {
 				}
 			}
 			if allowOrigin == "" {
-				// Origin not allowed — Vary already set; still serve the request
-				// (CORS is advisory to the browser; actual access control is server-side).
+				// Origin not in the allowed list — still serve the request because
+				// CORS is advisory to the browser; the server does not block
+				// cross-origin requests at the HTTP level. Actual access control
+				// must be enforced server-side (e.g. auth middleware).
+				logger.LogTrace("CORS: origin not allowed", "origin", origin)
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -153,7 +158,9 @@ func CORS(cfgs ...CORSConfig) func(http.Handler) http.Handler {
 				h.Set("Access-Control-Allow-Credentials", "true")
 			}
 			// Handle preflight — return immediately with 204, no body.
+			// Content-Length: 0 is set explicitly for proxy/CDN compatibility.
 			if r.Method == http.MethodOptions {
+				h.Set("Content-Length", "0")
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}

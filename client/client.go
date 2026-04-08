@@ -244,16 +244,20 @@ func New(cfg Config) *Client {
 
 // Do executes an HTTP request with retry and circuit breaker logic applied.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
-	// Resolve relative URLs against BaseURL when configured. Uses simple path
-	// joining (base + request path) rather than url.ResolveReference so that
-	// a base like "http://api.com/v1" + "/users" produces "http://api.com/v1/users",
-	// consistent with the Get()/Post() convenience methods.
+	// Resolve relative URLs against BaseURL when configured. Uses url.JoinPath
+	// for correct path joining that avoids double-slash or missing-segment issues.
 	if c.baseURL != "" && !isAbsolute(req.URL.String()) {
-		joined, err := neturl.Parse(strings.TrimRight(c.baseURL, "/") + "/" + strings.TrimLeft(req.URL.String(), "/"))
+		joined, err := neturl.JoinPath(c.baseURL, req.URL.String())
 		if err == nil {
-			req.URL = joined
-			if req.Host == "" {
-				req.Host = joined.Host
+			parsed, parseErr := neturl.Parse(joined)
+			if parseErr == nil {
+				// Preserve the original query string — JoinPath only joins paths.
+				parsed.RawQuery = req.URL.RawQuery
+				parsed.Fragment = req.URL.Fragment
+				req.URL = parsed
+				if req.Host == "" {
+					req.Host = parsed.Host
+				}
 			}
 		}
 	}

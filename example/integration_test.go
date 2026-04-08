@@ -101,12 +101,15 @@ func TestIntegration_SecurityHeaders(t *testing.T) {
 		"X-Frame-Options":              "DENY",
 		"Cross-Origin-Opener-Policy":   "same-origin",
 		"Cross-Origin-Resource-Policy": "same-origin",
-		"Server":                       "server",
 	}
 	for header, expected := range checks {
 		if got := resp.Header.Get(header); got != expected {
 			t.Errorf("header %s: expected %q, got %q", header, expected, got)
 		}
+	}
+	// Server header must not be set (avoids leaking technology stack info).
+	if got := resp.Header.Get("Server"); got != "" {
+		t.Errorf("Server header should not be set, got %q", got)
 	}
 }
 

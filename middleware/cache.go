@@ -39,6 +39,17 @@ type HTTPCacheConfig struct {
 	// It is called once per request and must return a string in the form
 	// "{userID}_{resourceName}" (e.g. "u42_products").
 	//
+	// IMPORTANT: In multi-tenant applications, KeyPrefix MUST include a
+	// user or tenant discriminator. If two different authenticated users
+	// share the same URL path, omitting the discriminator causes one user
+	// to see cached responses belonging to the other. Example:
+	//
+	//   KeyPrefix: func(r *http.Request) string {
+	//       uid := middleware.AuthIdentityFromContext(r)
+	//       if uid == "" { return "" } // skip cache for unauthenticated
+	//       return uid + "_products"
+	//   }
+	//
 	// Returning "" bypasses the cache entirely for that request, which is the
 	// correct behaviour for unauthenticated requests or routes that must never
 	// be cached.

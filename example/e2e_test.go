@@ -464,8 +464,8 @@ func TestE2E_MiddlewareChainHeaders(t *testing.T) {
 	if got := resp.Header.Get("X-Frame-Options"); got != "DENY" {
 		t.Errorf("X-Frame-Options: expected 'DENY', got %q", got)
 	}
-	if got := resp.Header.Get("Server"); got != "server" {
-		t.Errorf("Server: expected 'server', got %q", got)
+	if got := resp.Header.Get("Server"); got != "" {
+		t.Errorf("Server: expected empty (omitted), got %q", got)
 	}
 
 	// Request ID.

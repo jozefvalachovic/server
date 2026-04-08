@@ -175,6 +175,14 @@ type HTTPAuditConfig struct {
 // HTTPServerConfig consolidates all server construction options.
 // Every field is optional; the zero value produces a secure, production-ready
 // server with sensible defaults.
+//
+// # SSE / long-lived connections
+//
+// The server's IdleTimeout defaults to 30 s (config.HTTPIdleTimeout). For SSE
+// or long-poll endpoints, ensure the handler sends data (or a heartbeat via
+// response.SSEWriter.SendHeartbeat) within this interval to prevent the HTTP
+// server from closing the idle connection. Alternatively, list such paths in
+// TimeoutConfig.SkipPaths to exempt them from the per-request deadline.
 type HTTPServerConfig struct {
 	// TLSConfig enables TLS. When set, Start() reads HTTP_TLS_CERT_PATH and
 	// HTTP_TLS_KEY_PATH from the environment.

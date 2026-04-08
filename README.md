@@ -503,7 +503,6 @@ Evaluation order: Allowlist → Blocklist → allow. Empty Allowlist + empty Blo
 | `Referrer-Policy`           | `strict-origin-when-cross-origin`                                |
 | `Content-Security-Policy`   | `default-src 'self'; frame-ancestors 'none'`                     |
 | `Permissions-Policy`        | `geolocation=(), microphone=(), camera=()`                       |
-| `Server`                    | `server`                                                         |
 | `Strict-Transport-Security` | `max-age=31536000; includeSubDomains; preload` (production only) |
 
 HSTS is only added when `ENV=production`. The admin and swagger UI pages override the CSP to allow their embedded scripts and styles.
@@ -540,15 +539,22 @@ middleware.Compress(middleware.CompressConfig{
 middleware.Timeout(middleware.TimeoutConfig{
     Timeout:      10 * time.Second,
     ErrorMessage: "Request timed out. Please try again.",
+    SkipPaths:    []string{"/events", "/stream/"},
 })
 ```
 
-| Field          | Type            | Default                                | Description                      |
-| -------------- | --------------- | -------------------------------------- | -------------------------------- |
-| `Timeout`      | `time.Duration` | 30 s                                   | Per-request handler deadline     |
-| `ErrorMessage` | `string`        | "Request timed out. Please try again." | Message in the 504 response body |
+| Field          | Type            | Default                                | Description                                                |
+| -------------- | --------------- | -------------------------------------- | ---------------------------------------------------------- |
+| `Timeout`      | `time.Duration` | 30 s                                   | Per-request handler deadline                               |
+| `ErrorMessage` | `string`        | "Request timed out. Please try again." | Message in the 504 response body                           |
+| `SkipPaths`    | `[]string`      | none                                   | Exact or prefix paths (trailing `/`) exempt from timeout   |
 
 When the deadline fires, a 504 response is written and `r.Context()` is cancelled. If the handler already committed a response, no 504 is injected. Panics inside the timeout goroutine are recovered.
+
+> **SSE / long-poll note:** List SSE or streaming endpoint paths in `SkipPaths`
+> to exempt them from the per-request deadline. Also ensure SSE handlers send
+> heartbeats within the server's `IdleTimeout` (default 30 s) to prevent the
+> HTTP server from closing the idle connection. See `response.SSEWriter.SendHeartbeat`.
 
 ### Request ID
 

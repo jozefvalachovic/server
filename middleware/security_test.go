@@ -56,16 +56,12 @@ func TestSecurity_PermissionsPolicy(t *testing.T) {
 	}
 }
 
-func TestSecurity_ServerHeaderOpaque(t *testing.T) {
+func TestSecurity_ServerHeaderOmitted(t *testing.T) {
 	rec := applySecurityMiddleware(t)
 	got := rec.Header().Get("Server")
-	// The Server header should be a short opaque string that does not leak
-	// software name or version information.
-	if got == "" {
-		t.Fatal("Server header should be set to an opaque value, got empty")
-	}
-	if got != "server" {
-		t.Fatalf("Server header should be \"server\", got %q", got)
+	// The Server header must not be set to avoid leaking technology stack info.
+	if got != "" {
+		t.Fatalf("Server header should not be set, got %q", got)
 	}
 }
 

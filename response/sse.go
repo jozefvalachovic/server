@@ -31,7 +31,12 @@ func NewSSEWriter[T any](w http.ResponseWriter, r *http.Request) *SSEWriter[T] {
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	// Connection: keep-alive is a hop-by-hop header meaningful only in
+	// HTTP/1.x. HTTP/2+ multiplexes streams over a single connection and
+	// ignores this header; setting it there is technically incorrect.
+	if r.ProtoMajor == 1 {
+		w.Header().Set("Connection", "keep-alive")
+	}
 	w.WriteHeader(http.StatusOK)
 	f.Flush()
 
