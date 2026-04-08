@@ -15,6 +15,7 @@
     <div class="alert-error">{{.Error}}</div>
     {{- end}}
     <form method="POST" action="{{.Action}}{{if .Next}}?next={{.Next}}{{end}}">
+      <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
       <div class="form-group">
         <label for="username">Username</label>
         <input id="username" name="username" type="text" autocomplete="username" required autofocus>

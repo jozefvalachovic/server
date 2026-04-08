@@ -286,6 +286,9 @@ type TCPRateLimitConfig struct {
 // error message and is closed immediately, consistent with the TCP server's own
 // capacity-exceeded behaviour.
 //
+// The implementation uses the same shardedBuckets structure as HTTPRateLimit
+// to reduce lock contention under high-connection-rate workloads.
+//
 // Example — default config (10 conn/s, burst of 20):
 //
 //	middleware.TCPRateLimit()
@@ -322,16 +325,13 @@ func TCPRateLimit(cfgs ...TCPRateLimitConfig) func(func(net.Conn)) func(net.Conn
 		cfg.KeyFunc = connRemoteIP
 	}
 
-	var (
-		mu      sync.RWMutex
-		buckets = make(map[string]*rateBucket)
-	)
+	buckets := newShardedBuckets()
 
 	burst := float64(cfg.Burst)
 	rate := cfg.ConnectionsPerSecond
 
 	// Background goroutine removes idle buckets to prevent unbounded memory growth.
-	// Two-phase: collect stale keys under RLock, delete under a brief Lock.
+	// Uses the same sharded cleanup as HTTPRateLimit.
 	tcpCleanupCtx, tcpCleanupCancel := context.WithCancel(context.Background())
 	if cfg.Context != nil {
 		tcpCleanupCtx, tcpCleanupCancel = context.WithCancel(cfg.Context)
@@ -345,23 +345,7 @@ func TCPRateLimit(cfgs ...TCPRateLimitConfig) func(func(net.Conn)) func(net.Conn
 			case <-tcpCleanupCtx.Done():
 				return
 			case <-ticker.C:
-				now := time.Now()
-				mu.RLock()
-				var stale []string
-				for key, b := range buckets {
-					idle := now.Sub(time.Unix(0, b.lastSeen.Load()))
-					if idle > cfg.IdleTimeout {
-						stale = append(stale, key)
-					}
-				}
-				mu.RUnlock()
-				if len(stale) > 0 {
-					mu.Lock()
-					for _, key := range stale {
-						delete(buckets, key)
-					}
-					mu.Unlock()
-				}
+				buckets.cleanup(cfg.IdleTimeout)
 			}
 		}
 	}()
@@ -371,19 +355,7 @@ func TCPRateLimit(cfgs ...TCPRateLimitConfig) func(func(net.Conn)) func(net.Conn
 			key := cfg.KeyFunc(conn)
 			now := time.Now()
 
-			mu.RLock()
-			b, ok := buckets[key]
-			mu.RUnlock()
-			if !ok {
-				mu.Lock()
-				b, ok = buckets[key]
-				if !ok {
-					b = &rateBucket{tokens: burst}
-					b.lastSeen.Store(now.UnixNano())
-					buckets[key] = b
-				}
-				mu.Unlock()
-			}
+			b := buckets.getOrCreate(key, burst, now)
 
 			b.mu.Lock()
 			elapsed := now.Sub(time.Unix(0, b.lastSeen.Load())).Seconds()

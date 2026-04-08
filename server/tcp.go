@@ -74,6 +74,13 @@ type TCPServerConfig struct {
 
 	// NoWriteTimeout disables the write deadline entirely. Same semantics as
 	// NoReadTimeout but for write deadlines.
+	//
+	// Use this when the application handler manages its own per-write deadlines
+	// or when connections are expected to be idle for long periods (e.g. a
+	// pub/sub server where the server pushes messages asynchronously). Without
+	// a write deadline, a slow or unresponsive client may pin a goroutine
+	// indefinitely, so combine with an application-level heartbeat or liveness
+	// check.
 	NoWriteTimeout bool
 
 	// Middlewares are additional TCP middlewares applied after the built-in

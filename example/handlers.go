@@ -370,23 +370,34 @@ func validateEmail(w http.ResponseWriter, r *http.Request) {
 	}, http.StatusOK)
 }
 
+// cacheDemoStore is a process-scoped singleton cache store for the /cache-demo
+// endpoint. Creating a new store per request wastes CPU and memory; a shared
+// instance demonstrates the cache API without the overhead.
+var cacheDemoStore struct {
+	once  sync.Once
+	store *cache.CacheStore
+	err   error
+}
+
 // cacheDemo demonstrates cache.NewCacheStore, Set, Get, GetStats, and Export.
 func cacheDemo(w http.ResponseWriter, r *http.Request) {
-	s, err := cache.NewCacheStore(cache.CacheConfig{
-		MaxSize:         10,
-		DefaultTTL:      5 * time.Second,
-		CleanupInterval: 2 * time.Second,
-		MaxMemoryMB:     1,
+	cacheDemoStore.once.Do(func() {
+		cacheDemoStore.store, cacheDemoStore.err = cache.NewCacheStore(cache.CacheConfig{
+			MaxSize:         10,
+			DefaultTTL:      5 * time.Second,
+			CleanupInterval: 2 * time.Second,
+			MaxMemoryMB:     1,
+		})
 	})
-	if err != nil {
+	if cacheDemoStore.err != nil {
 		response.APIErrorWriter(w, response.APIError[any]{
 			Code:    http.StatusInternalServerError,
 			Message: "failed to create cache store",
-			Error:   new(err.Error()),
+			Error:   new(cacheDemoStore.err.Error()),
 		})
 		return
 	}
-	defer s.Stop()
+	s := cacheDemoStore.store
 
 	// Store and retrieve a value.
 	if err := s.Set("demo-key", "hello from cache", nil); err != nil {

@@ -44,6 +44,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"maps"
 	"net/http"
 	"reflect"
@@ -88,6 +89,14 @@ type Config struct {
 	Tools []Tool
 	// AllowedOrigins restricts the Access-Control-Allow-Origin header to the
 	// listed origins. When empty (the default) the header is set to "*".
+	//
+	// If the MCP endpoint is mounted behind the middleware.CORS layer, both
+	// layers will write CORS headers. To avoid duplicated or conflicting
+	// Access-Control-* values, either:
+	//   - Set identical origin lists in both Config.AllowedOrigins and
+	//     middleware.CORSConfig.AllowedOrigins, or
+	//   - Exclude the MCP path from middleware.CORS (e.g. via a path guard)
+	//     and let the MCP handler manage CORS alone.
 	AllowedOrigins []string
 	// AuthFunc is called before processing every JSON-RPC POST request.
 	// Return a non-nil error to reject the request with 401 Unauthorized.
@@ -274,6 +283,10 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if s.cfg.AuthFunc != nil {
 		if err := s.cfg.AuthFunc(r); err != nil {
+			slog.Warn("MCP auth failure",
+				"remote", r.RemoteAddr,
+				"error", err.Error(),
+			)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}

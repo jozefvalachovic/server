@@ -97,8 +97,8 @@ func Register(mux *http.ServeMux, cfg Config) {
 		_, _ = w.Write(adminJS)
 	})
 	// ── Metrics section ──────────────────────────────────────────────────
-	metricsLoginGet, metricsLoginPost := loginHandler("Metrics", "/metrics/", func(w http.ResponseWriter, errMsg string) {
-		renderAuth(w, authData{Section: "Metrics", Action: "/metrics/auth", Error: errMsg})
+	metricsLoginGet, metricsLoginPost := loginHandler("Metrics", "/metrics/", func(w http.ResponseWriter, errMsg, csrfToken, next string) {
+		renderAuth(w, authData{Section: "Metrics", Action: "/metrics/auth", Error: errMsg, CSRFToken: csrfToken, Next: next})
 	})
 	mux.HandleFunc("GET /metrics/auth", withCSP(metricsLoginGet))
 	mux.HandleFunc("POST /metrics/auth", metricsLoginPost)
@@ -110,8 +110,8 @@ func Register(mux *http.ServeMux, cfg Config) {
 	mux.Handle("/metrics/", metricsUI)
 
 	// ── Cache section ────────────────────────────────────────────────────
-	cacheLoginGet, cacheLoginPost := loginHandler("Cache", "/cache/", func(w http.ResponseWriter, errMsg string) {
-		renderAuth(w, authData{Section: "Cache", Action: "/cache/auth", Error: errMsg})
+	cacheLoginGet, cacheLoginPost := loginHandler("Cache", "/cache/", func(w http.ResponseWriter, errMsg, csrfToken, next string) {
+		renderAuth(w, authData{Section: "Cache", Action: "/cache/auth", Error: errMsg, CSRFToken: csrfToken, Next: next})
 	})
 	mux.HandleFunc("GET /cache/auth", withCSP(cacheLoginGet))
 	mux.HandleFunc("POST /cache/auth", cacheLoginPost)
@@ -134,7 +134,7 @@ func Register(mux *http.ServeMux, cfg Config) {
 
 func logoutHandler(authURL string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		clearSessionCookie(w)
+		clearSessionCookie(w, r)
 		http.Redirect(w, r, authURL, http.StatusFound)
 	}
 }
@@ -290,10 +290,11 @@ var (
 )
 
 type authData struct {
-	Section string
-	Action  string
-	Next    string
-	Error   string
+	Section   string
+	Action    string
+	Next      string
+	Error     string
+	CSRFToken string
 }
 
 type metricsData struct {

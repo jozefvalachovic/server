@@ -2,6 +2,7 @@ package admin
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +19,7 @@ import (
 
 const (
 	cookieName     = "_admin_session"
+	csrfCookieName = "_csrf_token"
 	sessionTTL     = 8 * time.Hour
 	authRedirParam = "next"
 )
@@ -100,14 +103,15 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, name, secret strin
 
 // clearSessionCookie expires the admin session cookie.
 // Cookie path remains "/" because admin routes span /metrics/, /cache/, and
-// /admin/* — there is no single common prefix. The HttpOnly + SameSite=Lax
-// flags prevent client-side JS and cross-site access.
-func clearSessionCookie(w http.ResponseWriter) {
+// /admin/* — there is no single common prefix. The HttpOnly + SameSite=Lax +
+// Secure flags prevent client-side JS, cross-site access, and plain-HTTP leaks.
+func clearSessionCookie(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     cookieName,
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
@@ -124,9 +128,50 @@ func requireAdmin(next http.Handler, authRedirectURL string) http.Handler {
 	})
 }
 
-// nonce generates a random hex string for use as a CSRF-equivalent one-time
-// field on login forms. Not strictly required for a tool-operator UI, but good
-// hygiene. Currently unused — reserved for future hardening.
+// ── CSRF double-submit cookie ────────────────────────────────────────────────
+
+// generateCSRFToken returns a 32-byte random hex string for the double-submit
+// cookie CSRF pattern.
+func generateCSRFToken() string {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// setCSRFCookie writes a short-lived CSRF cookie for the login form.
+func setCSRFCookie(w http.ResponseWriter, r *http.Request, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     csrfCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   900, // 15 minutes
+	})
+}
+
+// validCSRFToken checks that the form's _csrf field matches the CSRF cookie.
+func validCSRFToken(r *http.Request) bool {
+	c, err := r.Cookie(csrfCookieName)
+	if err != nil || c.Value == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(c.Value), []byte(r.FormValue("_csrf"))) == 1
+}
+
+// sanitizeRedirect validates and cleans a redirect path to prevent open-redirect
+// attacks. Returns "" when the input is empty, off-site, or otherwise unsafe.
+func sanitizeRedirect(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	clean := path.Clean(raw)
+	if len(clean) == 0 || clean[0] != '/' || strings.HasPrefix(clean, "//") {
+		return ""
+	}
+	return clean
+}
 
 // ── Login rate limiting ──────────────────────────────────────────────────────
 
@@ -226,13 +271,17 @@ func loginIP(r *http.Request) string {
 
 // loginHandler returns GET (render form) and POST (validate, set cookie) handlers
 // for the given section. onSuccess is the default redirect after login.
-func loginHandler(section, onSuccess string, tmplFn func(w http.ResponseWriter, errMsg string)) (get http.HandlerFunc, post http.HandlerFunc) {
+// The tmplFn callback receives the error message, CSRF token, and sanitised
+// ?next redirect so the template can embed them.
+func loginHandler(section, onSuccess string, tmplFn func(w http.ResponseWriter, errMsg, csrfToken, next string)) (get http.HandlerFunc, post http.HandlerFunc) {
 	get = func(w http.ResponseWriter, r *http.Request) {
 		if isAuthenticated(r) {
 			http.Redirect(w, r, onSuccess, http.StatusFound)
 			return
 		}
-		tmplFn(w, "")
+		csrf := generateCSRFToken()
+		setCSRFCookie(w, r, csrf)
+		tmplFn(w, "", csrf, sanitizeRedirect(r.URL.Query().Get(authRedirParam)))
 	}
 
 	post = func(w http.ResponseWriter, r *http.Request) {
@@ -246,6 +295,15 @@ func loginHandler(section, onSuccess string, tmplFn func(w http.ResponseWriter, 
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
+
+		// CSRF double-submit cookie check — must pass before credential validation.
+		if !validCSRFToken(r) {
+			csrf := generateCSRFToken()
+			setCSRFCookie(w, r, csrf)
+			tmplFn(w, "Invalid or expired form. Please try again.", csrf, sanitizeRedirect(r.URL.Query().Get(authRedirParam)))
+			return
+		}
+
 		wantName, wantSecret := adminCreds()
 		if wantName == "" || wantSecret == "" {
 			http.Error(w, "admin credentials not configured (ADMIN_NAME / ADMIN_SECRET)", http.StatusServiceUnavailable)
@@ -259,14 +317,16 @@ func loginHandler(section, onSuccess string, tmplFn func(w http.ResponseWriter, 
 		passOK := hmac.Equal([]byte(inputPass), []byte(wantSecret))
 		if !nameOK || !passOK {
 			recordLoginFailure(ip)
-			tmplFn(w, "Invalid username or password.")
+			csrf := generateCSRFToken()
+			setCSRFCookie(w, r, csrf)
+			tmplFn(w, "Invalid username or password.", csrf, sanitizeRedirect(r.URL.Query().Get(authRedirParam)))
 			return
 		}
 
 		setSessionCookie(w, r, wantName, wantSecret)
 
-		next := r.URL.Query().Get(authRedirParam)
-		if next == "" || !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") {
+		next := sanitizeRedirect(r.URL.Query().Get(authRedirParam))
+		if next == "" {
 			next = onSuccess
 		}
 		http.Redirect(w, r, next, http.StatusFound)

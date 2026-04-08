@@ -189,6 +189,18 @@ type Config struct {
 	BaseURL string
 }
 
+// HTTPError is returned by Client.Do when the server responds with a
+// non-retryable status code (or all retries are exhausted). Callers can
+// use errors.As to inspect the status code and response body.
+type HTTPError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("server returned %s", e.Status)
+}
+
 // Client is a resilient HTTP client with circuit breaker and retry support.
 type Client struct {
 	http    *http.Client
@@ -243,9 +255,12 @@ func New(cfg Config) *Client {
 }
 
 // Do executes an HTTP request with retry and circuit breaker logic applied.
+// The caller's req.URL is never modified; a clone is used when BaseURL
+// resolution is needed.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	// Resolve relative URLs against BaseURL when configured. Uses url.JoinPath
 	// for correct path joining that avoids double-slash or missing-segment issues.
+	// The original req.URL is cloned so the caller's value is never mutated.
 	if c.baseURL != "" && !isAbsolute(req.URL.String()) {
 		joined, err := neturl.JoinPath(c.baseURL, req.URL.String())
 		if err == nil {
@@ -254,6 +269,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 				// Preserve the original query string — JoinPath only joins paths.
 				parsed.RawQuery = req.URL.RawQuery
 				parsed.Fragment = req.URL.Fragment
+				req = req.Clone(req.Context())
 				req.URL = parsed
 				if req.Host == "" {
 					req.Host = parsed.Host
@@ -320,7 +336,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 				// Capture the status so the final error message is informative
 				// even when the HTTP round-trip itself succeeded (no transport error).
 				if lastErr == nil {
-					lastErr = fmt.Errorf("server returned HTTP %d", resp.StatusCode)
+					lastErr = &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status}
 				}
 				// Drain up to 1 MiB before closing so the transport can reuse the
 				// underlying TCP connection. Bodies larger than the cap are not
@@ -362,6 +378,38 @@ func (c *Client) Post(ctx context.Context, url, contentType string, body io.Read
 		return nil, err
 	}
 	req.Header.Set("Content-Type", contentType)
+	return c.Do(req)
+}
+
+// Put is a convenience wrapper around Do for PUT requests.
+// The url parameter can be absolute or relative to BaseURL.
+func (c *Client) Put(ctx context.Context, url, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	return c.Do(req)
+}
+
+// Patch is a convenience wrapper around Do for PATCH requests.
+// The url parameter can be absolute or relative to BaseURL.
+func (c *Client) Patch(ctx context.Context, url, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	return c.Do(req)
+}
+
+// Delete is a convenience wrapper around Do for DELETE requests.
+// The url parameter can be absolute or relative to BaseURL.
+func (c *Client) Delete(ctx context.Context, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return nil, err
+	}
 	return c.Do(req)
 }
 

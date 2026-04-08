@@ -31,6 +31,9 @@ type Collector struct {
 func NewCollector() *Collector { return &Collector{} }
 
 func (c *Collector) stats(pattern string) *routeStats {
+	if v, ok := c.m.Load(pattern); ok {
+		return v.(*routeStats)
+	}
 	v, _ := c.m.LoadOrStore(pattern, &routeStats{minMs: math.MaxInt64})
 	return v.(*routeStats)
 }

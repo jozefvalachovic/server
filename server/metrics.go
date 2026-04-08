@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
@@ -17,6 +18,10 @@ import (
 // consistent with how HTTP_PORT and TCP_PORT are resolved for the main servers.
 type MetricsServerConfig struct {
 	Handler http.Handler
+	// TLSConfig enables TLS on the metrics server. When set, the server reads
+	// METRICS_TLS_CERT_PATH and METRICS_TLS_KEY_PATH from the environment.
+	// nil disables TLS (default).
+	TLSConfig *tls.Config
 }
 
 // MetricsServer holds the metrics HTTP server instance
@@ -52,6 +57,7 @@ func StartMetricsServer(cfg *MetricsServerConfig) (*MetricsServer, error) {
 	server := &http.Server{
 		Addr:              host + ":" + port,
 		Handler:           mux,
+		TLSConfig:         cfg.TLSConfig,
 		ReadHeaderTimeout: 5 * time.Second, // guard against slow-header attacks
 		IdleTimeout:       30 * time.Second,
 		ReadTimeout:       10 * time.Second,
@@ -60,8 +66,16 @@ func StartMetricsServer(cfg *MetricsServerConfig) (*MetricsServer, error) {
 
 	go func() {
 		logger.LogInfo("Metrics server starting", "port", port)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.LogError("Metrics server error", "error", err.Error())
+		var serveErr error
+		if cfg.TLSConfig != nil {
+			certFile := os.Getenv("METRICS_TLS_CERT_PATH")
+			keyFile := os.Getenv("METRICS_TLS_KEY_PATH")
+			serveErr = server.ListenAndServeTLS(certFile, keyFile)
+		} else {
+			serveErr = server.ListenAndServe()
+		}
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			logger.LogError("Metrics server error", "error", serveErr.Error())
 		}
 	}()
 

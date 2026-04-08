@@ -153,13 +153,18 @@ jobs:
         run: |
           if git ls-remote --tags origin "refs/tags/$TAG" | grep -q "$TAG"; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Tag $TAG already exists — skipping."
+            echo "Tag $TAG already exists — will replace."
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Delete existing tag
+        if: steps.check.outputs.exists == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: git push origin ":refs/tags/$TAG"
+
       - name: Create and push tag
-        if: steps.check.outputs.exists == 'false'
         env:
           TAG: ${{ steps.version.outputs.tag }}
         run: |

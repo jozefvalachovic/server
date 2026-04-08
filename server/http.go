@@ -147,6 +147,10 @@ type ClientRetryConfig = client.RetryConfig
 // ClientCircuitBreakerConfig is a re-export of client.CircuitBreakerConfig.
 type ClientCircuitBreakerConfig = client.CircuitBreakerConfig
 
+// ClientHTTPError is a re-export of client.HTTPError — returned when the
+// server responds with a non-retryable status. Use errors.As to inspect.
+type ClientHTTPError = client.HTTPError
+
 // NewClient creates a new resilient Client. Re-export of client.New so callers
 // only need to import "server".
 var NewClient = client.New
@@ -329,6 +333,13 @@ type HTTPServer struct {
 // limitedListener wraps a net.Listener and enforces a maximum number of
 // concurrent accepted connections via a semaphore channel, mirroring the
 // TCP server’s connSem pattern.
+//
+// Unlike the simpler “block on semaphore before Accept” approach, this
+// implementation accepts the connection first and then tries to acquire a
+// slot non-blockingly. When at capacity the new connection is closed
+// immediately so the client learns quickly instead of hanging in the OS
+// TCP backlog. A temporary error is returned so http.Server backs off
+// and retries Accept without stopping.
 type limitedListener struct {
 	net.Listener
 	sem chan struct{}
@@ -339,14 +350,27 @@ func newLimitedListener(l net.Listener, maxConns int) *limitedListener {
 }
 
 func (l *limitedListener) Accept() (net.Conn, error) {
-	l.sem <- struct{}{} // blocks when at capacity; OS backlog acts as overflow buffer
 	conn, err := l.Listener.Accept()
 	if err != nil {
-		<-l.sem
 		return nil, err
 	}
-	return &semConn{Conn: conn, release: func() { <-l.sem }}, nil
+	select {
+	case l.sem <- struct{}{}:
+		return &semConn{Conn: conn, release: func() { <-l.sem }}, nil
+	default:
+		_ = conn.Close()
+		return nil, &tempAcceptError{}
+	}
 }
+
+// tempAcceptError is a temporary net.Error returned when the connection
+// semaphore is full. http.Server treats temporary errors by sleeping briefly
+// and retrying Accept, which provides natural backpressure.
+type tempAcceptError struct{}
+
+func (tempAcceptError) Error() string   { return "server at max connections" }
+func (tempAcceptError) Timeout() bool   { return false }
+func (tempAcceptError) Temporary() bool { return true }
 
 // semConn releases the semaphore slot exactly once when the connection closes.
 type semConn struct {

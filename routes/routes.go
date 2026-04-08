@@ -184,3 +184,23 @@ func RegisterRouteList(mux *http.ServeMux, routes []Route) {
 		mux.Handle(path, RouteHandler(r))
 	}
 }
+
+// RegisterGroup registers routes that share a common set of middleware.
+// This avoids repeating the same middleware list on every Route and makes
+// intent explicit when a block of endpoints share cross-cutting behaviour
+// (e.g. authentication, auditing).
+//
+// Example:
+//
+//	routes.RegisterGroup(mux, []func(http.Handler) http.Handler{authMiddleware}, []routes.Route{
+//	    {Method: http.MethodGet, Path: "/users", Handler: listUsers},
+//	    {Method: http.MethodPost, Path: "/users", Handler: createUser},
+//	})
+func RegisterGroup(mux *http.ServeMux, groupMiddlewares []func(http.Handler) http.Handler, routes []Route) {
+	for i := range routes {
+		// Prepend group middleware before any per-route middleware so that the
+		// group layer is always outermost.
+		routes[i].Middlewares = append(groupMiddlewares, routes[i].Middlewares...)
+	}
+	RegisterRouteList(mux, routes)
+}
