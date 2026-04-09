@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
+
+	"github.com/jozefvalachovic/logger/v4"
 )
 
 const (
@@ -82,6 +84,12 @@ func RequestID(cfgs ...RequestIDConfig) func(http.Handler) http.Handler {
 			// Propagate via context so handlers can access it without header parsing.
 			ctx := r.Context()
 			ctx = contextWithRequestID(ctx, id)
+
+			// Store a request-scoped logger enriched with the request ID.
+			// Downstream middleware (e.g. TraceContext) may further enrich it.
+			child := logger.FromContext(ctx).With("requestId", id)
+			ctx = logger.NewContext(ctx, child)
+
 			r = r.WithContext(ctx)
 
 			w.Header().Set(cfg.Header, id)

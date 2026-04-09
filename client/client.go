@@ -42,6 +42,11 @@ const (
 )
 
 // CircuitBreakerConfig configures a per-client circuit breaker.
+//
+// The circuit breaker is scoped to the entire Client instance, not per-host.
+// If one Client talks to multiple backends, a failure burst on one backend
+// opens the circuit for all of them. For multi-backend setups, create a
+// separate Client per downstream service so each has an independent breaker.
 type CircuitBreakerConfig struct {
 	// Threshold is the number of consecutive failures required to open the
 	// circuit. Default: 5.

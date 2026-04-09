@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -85,6 +86,12 @@ func withCSP(h http.HandlerFunc) http.HandlerFunc {
 //	/cache/entry/{k}  — DELETE a single cache key (AJAX, protected)
 //	/cache/flush      — POST to flush all cache keys (AJAX, protected)
 func Register(mux *http.ServeMux, cfg Config) {
+	// Warn operators when the admin secret is too short to resist brute-force
+	// attacks on the HMAC-SHA256 session cookie.
+	if _, secret := adminCreds(); secret != "" && len(secret) < 32 {
+		fmt.Fprintf(os.Stderr, "WARNING: ADMIN_SECRET is only %d characters; use at least 32 for adequate security\n", len(secret))
+	}
+
 	// ── Static assets ────────────────────────────────────────────────────
 	mux.HandleFunc("GET /admin/style.css", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/css; charset=utf-8")

@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/jozefvalachovic/logger/v4"
 )
 
 // serveCapture runs the middleware and exposes the request seen by the inner handler.
@@ -107,5 +109,21 @@ func TestRequestIDFromContext_EmptyWhenAbsent(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	if got := RequestIDFromContext(req); got != "" {
 		t.Fatalf("expected empty string, got %q", got)
+	}
+}
+
+func TestRequestID_EnrichesLoggerContext(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	_, inner := serveCapture(RequestID(), req)
+
+	// The middleware should store an enriched logger in the request context.
+	l := logger.FromContext(inner.Context())
+	if l == nil {
+		t.Fatal("expected non-nil logger from context")
+	}
+	// DefaultLogger() is the fallback — if we get the same pointer, the
+	// middleware didn't store a child logger.
+	if l == logger.DefaultLogger() {
+		t.Fatal("expected enriched child logger, got DefaultLogger")
 	}
 }

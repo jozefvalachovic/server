@@ -44,6 +44,7 @@ type checkDetail struct {
 type HealthChecker struct {
 	mu          sync.RWMutex
 	checks      map[string]CheckFunc
+	critical    map[string]struct{} // names of critical checks; any failure → HealthStatusDown
 	version     string
 	timeout     time.Duration
 	redactNames bool // when true, check names are replaced with generic keys in responses
@@ -59,9 +60,10 @@ func NewHealthChecker(version string, checkTimeout time.Duration) *HealthChecker
 		checkTimeout = 5 * time.Second
 	}
 	return &HealthChecker{
-		checks:  make(map[string]CheckFunc),
-		version: version,
-		timeout: checkTimeout,
+		checks:   make(map[string]CheckFunc),
+		critical: make(map[string]struct{}),
+		version:  version,
+		timeout:  checkTimeout,
 	}
 }
 
@@ -79,12 +81,25 @@ func (h *HealthChecker) RegisterLoggerHealthCheck() {
 //	hc.Register("postgres", func(ctx context.Context) error {
 //	    return db.PingContext(ctx)
 //	})
-//	hc.Register("redis", func(ctx context.Context) error {
-//	    return redisClient.Ping(ctx).Err()
-//	})
 func (h *HealthChecker) Register(name string, fn CheckFunc) {
 	h.mu.Lock()
 	h.checks[name] = fn
+	h.mu.Unlock()
+}
+
+// RegisterCritical adds or replaces a named dependency check and marks it as
+// critical. When any critical check fails, the overall status is HealthStatusDown
+// and the readiness endpoint returns 503 — causing Kubernetes to remove the pod
+// from service. Use this for dependencies without which the service cannot
+// function at all (e.g. primary database, message broker).
+//
+//	hc.RegisterCritical("postgres", func(ctx context.Context) error {
+//	    return db.PingContext(ctx)
+//	})
+func (h *HealthChecker) RegisterCritical(name string, fn CheckFunc) {
+	h.mu.Lock()
+	h.checks[name] = fn
+	h.critical[name] = struct{}{}
 	h.mu.Unlock()
 }
 
@@ -92,6 +107,7 @@ func (h *HealthChecker) Register(name string, fn CheckFunc) {
 func (h *HealthChecker) Deregister(name string) {
 	h.mu.Lock()
 	delete(h.checks, name)
+	delete(h.critical, name)
 	h.mu.Unlock()
 }
 
@@ -116,6 +132,8 @@ func (h *HealthChecker) Result(ctx context.Context) HealthCheckResult {
 	}
 	checks := make(map[string]CheckFunc, n)
 	maps.Copy(checks, h.checks)
+	criticalSet := make(map[string]struct{}, len(h.critical))
+	maps.Copy(criticalSet, h.critical)
 	h.mu.RUnlock()
 
 	type entry struct {
@@ -147,6 +165,7 @@ func (h *HealthChecker) Result(ctx context.Context) HealthCheckResult {
 
 	details := make(map[string]checkDetail, len(checks))
 	anyDown := false
+	anyCriticalDown := false
 	// allDown starts true when there are registered checks and flips false
 	// the moment a healthy check is seen. When len(checks)==0 the loop body
 	// never executes, allDown stays false, and the switch falls through to
@@ -158,6 +177,9 @@ func (h *HealthChecker) Result(ctx context.Context) HealthCheckResult {
 		details[e.name] = e.detail
 		if e.detail.Status == HealthStatusDown {
 			anyDown = true
+			if _, isCritical := criticalSet[e.name]; isCritical {
+				anyCriticalDown = true
+			}
 		} else {
 			allDown = false
 		}
@@ -166,6 +188,9 @@ func (h *HealthChecker) Result(ctx context.Context) HealthCheckResult {
 	var overall HealthStatus
 	switch {
 	case allDown && anyDown:
+		overall = HealthStatusDown
+	case anyCriticalDown:
+		// Any critical dependency failure makes the service unfit for traffic.
 		overall = HealthStatusDown
 	case anyDown:
 		overall = HealthStatusDegraded

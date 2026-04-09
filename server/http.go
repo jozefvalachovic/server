@@ -366,11 +366,21 @@ func (l *limitedListener) Accept() (net.Conn, error) {
 // tempAcceptError is a temporary net.Error returned when the connection
 // semaphore is full. http.Server treats temporary errors by sleeping briefly
 // and retrying Accept, which provides natural backpressure.
+//
+// NOTE: net.Error.Temporary() is deprecated since Go 1.18 but http.Server's
+// internal accept loop still checks it to decide whether to back off vs stop.
+// Until http.Server provides an alternative signalling mechanism, this is the
+// only way to tell the server "transient — retry Accept" without terminating
+// the serve loop.
 type tempAcceptError struct{}
 
-func (tempAcceptError) Error() string   { return "server at max connections" }
-func (tempAcceptError) Timeout() bool   { return false }
-func (tempAcceptError) Temporary() bool { return true }
+func (tempAcceptError) Error() string { return "server at max connections" }
+func (tempAcceptError) Timeout() bool { return false }
+
+// Deprecated: Temporary is deprecated per the net.Error interface since Go 1.18.
+// It is retained here because http.Server still relies on it internally to
+// distinguish transient accept failures from fatal ones.
+func (tempAcceptError) Temporary() bool { return true } //nolint:staticcheck
 
 // semConn releases the semaphore slot exactly once when the connection closes.
 type semConn struct {

@@ -21,7 +21,7 @@ func TestHealthChecker_ZeroChecks(t *testing.T) {
 func TestHealthChecker_AllUp(t *testing.T) {
 	hc := NewHealthChecker("", 5*time.Second)
 	hc.Register("db", func(ctx context.Context) error { return nil })
-	hc.Register("redis", func(ctx context.Context) error { return nil })
+	hc.Register("s3", func(ctx context.Context) error { return nil })
 	r := hc.Result(context.Background())
 	if r.Status != HealthStatusOK {
 		t.Fatalf("want ok, got %s", r.Status)
@@ -34,7 +34,7 @@ func TestHealthChecker_AllUp(t *testing.T) {
 func TestHealthChecker_Degraded(t *testing.T) {
 	hc := NewHealthChecker("", 5*time.Second)
 	hc.Register("db", func(ctx context.Context) error { return nil })
-	hc.Register("redis", func(ctx context.Context) error { return errors.New("connection refused") })
+	hc.Register("s3", func(ctx context.Context) error { return errors.New("connection refused") })
 	r := hc.Result(context.Background())
 	if r.Status != HealthStatusDegraded {
 		t.Fatalf("want degraded, got %s", r.Status)
@@ -44,7 +44,7 @@ func TestHealthChecker_Degraded(t *testing.T) {
 func TestHealthChecker_AllDown(t *testing.T) {
 	hc := NewHealthChecker("", 5*time.Second)
 	hc.Register("db", func(ctx context.Context) error { return errors.New("down") })
-	hc.Register("redis", func(ctx context.Context) error { return errors.New("down") })
+	hc.Register("s3", func(ctx context.Context) error { return errors.New("down") })
 	r := hc.Result(context.Background())
 	if r.Status != HealthStatusDown {
 		t.Fatalf("want down, got %s", r.Status)
@@ -90,5 +90,47 @@ func TestHealthChecker_Redact(t *testing.T) {
 	}
 	if _, ok := r.Checks["check_0"]; !ok {
 		t.Fatal("expected redacted key check_0")
+	}
+}
+
+func TestHealthChecker_CriticalDown_ForcesDown(t *testing.T) {
+	hc := NewHealthChecker("", 5*time.Second)
+	// One critical check that fails, one regular check that succeeds.
+	hc.RegisterCritical("postgres", func(ctx context.Context) error { return errors.New("connection refused") })
+	hc.Register("s3", func(ctx context.Context) error { return nil })
+	r := hc.Result(context.Background())
+	if r.Status != HealthStatusDown {
+		t.Fatalf("want down when critical check fails, got %s", r.Status)
+	}
+}
+
+func TestHealthChecker_CriticalUp_NonCriticalDown_Degraded(t *testing.T) {
+	hc := NewHealthChecker("", 5*time.Second)
+	// Critical check passes, non-critical check fails → degraded, not down.
+	hc.RegisterCritical("postgres", func(ctx context.Context) error { return nil })
+	hc.Register("s3", func(ctx context.Context) error { return errors.New("timeout") })
+	r := hc.Result(context.Background())
+	if r.Status != HealthStatusDegraded {
+		t.Fatalf("want degraded when only non-critical fails, got %s", r.Status)
+	}
+}
+
+func TestHealthChecker_AllCriticalUp(t *testing.T) {
+	hc := NewHealthChecker("", 5*time.Second)
+	hc.RegisterCritical("postgres", func(ctx context.Context) error { return nil })
+	hc.RegisterCritical("kafka", func(ctx context.Context) error { return nil })
+	r := hc.Result(context.Background())
+	if r.Status != HealthStatusOK {
+		t.Fatalf("want ok when all critical checks pass, got %s", r.Status)
+	}
+}
+
+func TestHealthChecker_DeregisterCritical(t *testing.T) {
+	hc := NewHealthChecker("", 5*time.Second)
+	hc.RegisterCritical("postgres", func(ctx context.Context) error { return errors.New("fail") })
+	hc.Deregister("postgres")
+	r := hc.Result(context.Background())
+	if r.Status != HealthStatusOK {
+		t.Fatalf("want ok after deregistering critical check, got %s", r.Status)
 	}
 }

@@ -61,7 +61,7 @@ func e2eServer(t *testing.T) (baseURL string, cleanup func()) {
 	}
 
 	hc := server.NewHealthChecker("1.0.0-e2e", 5*time.Second)
-	hc.Register("cache", func(ctx context.Context) error {
+	hc.RegisterCritical("cache", func(ctx context.Context) error {
 		if store == nil {
 			return errors.New("cache store not initialised")
 		}

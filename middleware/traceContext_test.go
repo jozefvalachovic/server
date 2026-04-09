@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/jozefvalachovic/logger/v4"
 )
 
 // ── TraceContext ──────────────────────────────────────────────────────────────
@@ -180,5 +182,19 @@ func TestTraceContext_DefaultFlags(t *testing.T) {
 	parts := strings.Split(tp, "-")
 	if parts[3] != "00" {
 		t.Fatalf("expected default flags 00, got %q", parts[3])
+	}
+}
+
+func TestTraceContext_EnrichesLoggerContext(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	_, inner := serveCapture(TraceContext(), req)
+
+	// The middleware should store an enriched logger with traceId and spanId.
+	l := logger.FromContext(inner.Context())
+	if l == nil {
+		t.Fatal("expected non-nil logger from context")
+	}
+	if l == logger.DefaultLogger() {
+		t.Fatal("expected enriched child logger, got DefaultLogger")
 	}
 }

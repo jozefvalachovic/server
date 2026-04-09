@@ -78,10 +78,12 @@ func main() {
 	// LivenessHandler (/healthz) always returns 200 — it only proves the
 	// process is alive and intentionally skips dep checks to avoid k8s
 	// restart cascades. ReadinessHandler (/readyz) runs all registered
-	// checks concurrently and returns 503 when any dependency is unhealthy.
+	// checks concurrently and returns 503 when any critical dependency is
+	// down. Non-critical failures result in "degraded" (200); critical
+	// failures force "down" (503).
 	hc := server.NewHealthChecker("1.0.0", 5*time.Second)
 	hc.RegisterLoggerHealthCheck()
-	hc.Register("cache", func(ctx context.Context) error {
+	hc.RegisterCritical("cache", func(ctx context.Context) error {
 		_ = ctx
 		if store == nil {
 			return errors.New("cache store not initialised")
@@ -188,7 +190,7 @@ func main() {
 				Method:      swagger.GET,
 				Path:        "/readyz",
 				Summary:     "Readiness probe (runs all dep checks)",
-				Description: "Returns 503 when any registered dependency check fails. Includes per-check latency.",
+				Description: "Returns 503 when any critical dependency check fails. Non-critical failures return 200 with degraded status.",
 				Tags:        []string{"ops"},
 			},
 			{

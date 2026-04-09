@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"net/http"
 	"strings"
+
+	"github.com/jozefvalachovic/logger/v4"
 )
 
 const (
@@ -82,6 +84,11 @@ func TraceContext(cfgs ...TraceContextConfig) func(http.Handler) http.Handler {
 			info.TraceState = r.Header.Get(TracestateHeader)
 
 			ctx := context.WithValue(r.Context(), traceInfoKey, info)
+
+			// Enrich the request-scoped logger with trace identifiers.
+			child := logger.FromContext(ctx).With("traceId", info.TraceID, "spanId", info.SpanID)
+			ctx = logger.NewContext(ctx, child)
+
 			r = r.WithContext(ctx)
 
 			// Set response headers so the next hop can continue the trace.

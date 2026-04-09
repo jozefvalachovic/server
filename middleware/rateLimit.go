@@ -2,15 +2,23 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"hash/maphash"
+	"math"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/jozefvalachovic/server/response"
 )
+
+// ErrRateLimitExceeded is a sentinel error for programmatic detection of
+// rate-limit rejections in tests, middleware chains, or error-handling logic.
+// Use errors.Is(err, middleware.ErrRateLimitExceeded) to check.
+var ErrRateLimitExceeded = errors.New("rate limit exceeded")
 
 // rateLimitShards is the number of independent map shards used by the HTTP
 // rate limiter. 16 shards reduce lock contention by ~16× under high-concurrency
@@ -180,6 +188,9 @@ func HTTPRateLimit(cfgs ...HTTPRateLimitConfig) func(http.Handler) http.Handler 
 	burst := float64(cfg.Burst)
 	rate := cfg.RequestsPerSecond
 
+	// Pre-compute Retry-After header value: ceil(1/rate) seconds, minimum 1.
+	retryAfter := strconv.Itoa(int(math.Ceil(1.0 / rate)))
+
 	// Background goroutine removes idle buckets to prevent unbounded memory growth.
 	// Each shard is locked independently so cleanup never blocks live traffic
 	// on other shards.
@@ -219,6 +230,9 @@ func HTTPRateLimit(cfgs ...HTTPRateLimitConfig) func(http.Handler) http.Handler 
 			b.mu.Unlock()
 
 			if !allow {
+				// RFC 6585 §4: Retry-After tells well-behaved clients how
+				// long to wait. We use ceil(1/rate) as a reasonable estimate.
+				w.Header().Set("Retry-After", retryAfter)
 				response.APIErrorWriter(w, response.APIError[any]{
 					Code:    cfg.StatusCode,
 					Error:   response.ErrTooManyRequests,

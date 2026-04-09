@@ -21,6 +21,7 @@ go get github.com/jozefvalachovic/server@latest
 - [routes](#routes) — Route registration, method routing, swagger/MCP helpers
 - [response](#response) — Typed JSON response writers and request body decoding
 - [request](#request) — IP address extraction, email validation
+- [Request-scoped logging](#request-scoped-logging) — Automatic logger context enrichment
 - [cache](#cache) — In-memory key-value store with TTL, eviction, and stats
 - [client](#client) — Resilient HTTP client with retry and circuit breaker
 - [mcp](#mcp) — Model Context Protocol tool server
@@ -269,8 +270,8 @@ The TCP server wraps every connection in a `*deadlineConn` that resets read/writ
 ```go
 hc := server.NewHealthChecker("1.0.0", 5*time.Second)
 hc.Register("postgres", func(ctx context.Context) error { return db.PingContext(ctx) })
-hc.Register("redis",    func(ctx context.Context) error { return rdb.Ping(ctx).Err() })
-hc.Deregister("redis")               // remove a check at runtime
+hc.RegisterCritical("postgres", func(ctx context.Context) error { return db.PingContext(ctx) })
+hc.Deregister("postgres")             // remove a check at runtime
 hc.SetRedactCheckNames(true)          // hide dependency names in external responses
 
 mux.HandleFunc("GET /healthz", hc.LivenessHandler())  // always 200 OK
@@ -280,7 +281,9 @@ mux.HandleFunc("GET /readyz",  hc.ReadinessHandler())  // 200 / 503 based on che
 result := hc.Result(ctx) // HealthCheckResult{Status, Checks, Version}
 ```
 
-Health status: `ok` (all pass), `degraded` (some fail — still returns 200), `down` (all fail — returns 503).
+`RegisterCritical` marks a dependency as essential. When **any** critical check fails, the overall status is forced to `down` (503) regardless of other check outcomes — causing Kubernetes to remove the pod from service. Use `Register` for non-essential dependencies whose failure should not trigger a pod restart.
+
+Health status: `ok` (all pass), `degraded` (some non-critical fail — still returns 200), `down` (any critical fail, or all fail — returns 503).
 
 ### Metrics server
 
@@ -363,6 +366,10 @@ identity := middleware.AuthIdentityFromContext(r)
 | `SkipPaths`    | `[]string`                          | none          | Exact match or prefix match (trailing `/`) to bypass auth |
 
 `SkipPaths` supports both exact match (`"/healthz"`) and prefix match (`"/admin/"` matches all `/admin/*`).
+
+**Token verification helpers:**
+
+`TokenStore` is an exported, thread-safe in-memory token set for fast `O(1)` credential lookups. Use it with `MultiTokenVerify` or `RotatingTokenVerify` for multi-token and zero-downtime rotation scenarios. All internal comparisons use constant-time HMAC-SHA256 to prevent timing side-channels.
 
 ### HTTP cache
 
@@ -470,6 +477,8 @@ middleware.TCPRateLimit(middleware.TCPRateLimitConfig{
 
 Both rate limiters use per-key token buckets with automatic background cleanup. The HTTP rate limiter partitions buckets across 16 lock-sharded segments (keyed via `maphash`) so high-concurrency workloads rarely contend on the same lock.
 
+When an HTTP request is rejected, the response includes a `Retry-After` header (in seconds) computed as `⌈1 / RequestsPerSecond⌉`, telling the client the minimum wait before retrying. The rejection also wraps the sentinel `middleware.ErrRateLimitExceeded` which can be checked with `errors.Is` in tests or middleware chains.
+
 ### IP filter
 
 ```go
@@ -575,6 +584,8 @@ id := middleware.RequestIDFromContext(r)
 
 If the incoming request already carries the header, the existing value is preserved.
 
+The middleware also enriches the request-scoped logger (via `logger.NewContext`) with the `requestId` field, so all downstream log calls using `logger.FromContext(r.Context())` automatically include the request ID.
+
 ### Trace context (W3C)
 
 ```go
@@ -596,6 +607,8 @@ Propagates the `traceparent` and `tracestate` headers per the
 When the incoming request carries a valid `traceparent`, the trace-id and
 flags are preserved; a new span-id is generated for this service. When
 absent or malformed, a brand-new trace is started.
+
+The middleware enriches the request-scoped logger with `traceId` and `spanId` fields, so all downstream log calls using `logger.FromContext(r.Context())` automatically include trace identifiers.
 
 `TraceInfoFromContext(r)` returns a `TraceInfo` struct:
 
@@ -876,9 +889,39 @@ clean := request.SanitizeEmail(email)   // lowercase + trim
 
 ---
 
+## Request-scoped logging
+
+The `RequestID` and `TraceContext` middleware automatically enrich the request-scoped logger carried in `context.Context`. Every handler downstream can retrieve the enriched logger without manually threading fields:
+
+```go
+func myHandler(w http.ResponseWriter, r *http.Request) {
+    log := logger.FromContext(r.Context())
+    log.LogInfo("handling request")
+    // Output includes requestId, traceId, spanId automatically
+}
+```
+
+The enrichment chain builds incrementally through the middleware stack:
+
+| Middleware       | Fields added                   |
+| ---------------- | ------------------------------ |
+| `RequestID`      | `requestId`                    |
+| `TraceContext`    | `traceId`, `spanId`            |
+
+Custom middleware can further extend the context logger using the same pattern:
+
+```go
+child := logger.FromContext(ctx).With("userId", uid)
+ctx = logger.NewContext(ctx, child)
+```
+
+---
+
 ## cache
 
 In-memory key-value store with TTL, oldest-first eviction, memory limits, and lazy expiry on read.
+
+Internally the store partitions entries across **16 lock-sharded segments** (keyed via `maphash`), so concurrent reads and writes to different keys rarely contend on the same lock. All public methods are safe for concurrent use.
 
 The eviction policy is **oldest-first (FIFO)**: a min-heap ordered by `createdAt` evicts the entry that was inserted earliest. Updating a key refreshes its TTL but preserves the original `createdAt`, so frequently-refreshed hot keys are not pinned against eviction.
 
@@ -910,6 +953,8 @@ exported := store.Export()      // snapshot of all entries
 | `cache.ErrInvalidKey`             | Empty key string                            |
 | `cache.ErrInvalidTTL`             | TTL ≤ 0                                     |
 | `cache.ErrInvalidCleanupInterval` | CleanupInterval ≤ 0                         |
+| `cache.ErrInvalidMaxSize`         | MaxSize ≤ 0                                 |
+| `cache.ErrInvalidMaxMemory`       | MaxMemoryMB ≤ 0                             |
 | `cache.ErrEntryTooLarge`          | Entry exceeds `MaxMemoryMB` and was evicted |
 
 **Cache keys for HTTP response caching:**
@@ -963,6 +1008,8 @@ backoff = InitialBackoff × Multiplier^(attempt-1) ± JitterFraction
 Capped at `MaxBackoff`. Defaults: `Multiplier=2.0`, `JitterFraction=0.2` (±20%), `MaxBackoff=10s`.
 
 **Circuit breaker states:**
+
+The circuit breaker is **per-`Client` instance**, not per-host. If the client is used against multiple backends, failures to one backend count towards the shared failure threshold. Create separate `Client` instances when independent circuit breakers per upstream are needed.
 
 ```
 Closed ──(Threshold consecutive failures)──► Open
@@ -1180,6 +1227,7 @@ Use `errors.Is` to handle specific error conditions:
 ```go
 import "github.com/jozefvalachovic/server/cache"
 import "github.com/jozefvalachovic/server/client"
+import "github.com/jozefvalachovic/server/middleware"
 
 // Cache
 val, err := store.Get("key")
@@ -1192,16 +1240,24 @@ resp, err := c.Get(ctx, "/endpoint")
 if errors.Is(err, client.ErrCircuitOpen) {
     // circuit is open — back off
 }
+
+// Rate limiting
+if errors.Is(err, middleware.ErrRateLimitExceeded) {
+    // request was rejected — check Retry-After header
+}
 ```
 
-| Package  | Error                       | Condition                             |
-| -------- | --------------------------- | ------------------------------------- |
-| `cache`  | `ErrNotFound`               | Key missing or expired                |
-| `cache`  | `ErrInvalidKey`             | Empty key string                      |
-| `cache`  | `ErrInvalidTTL`             | TTL ≤ 0                               |
-| `cache`  | `ErrInvalidCleanupInterval` | CleanupInterval ≤ 0                   |
-| `cache`  | `ErrEntryTooLarge`          | Entry exceeds `MaxMemoryMB` (evicted) |
-| `client` | `ErrCircuitOpen`            | Circuit breaker is open               |
+| Package      | Error                       | Condition                             |
+| ------------ | --------------------------- | ------------------------------------- |
+| `cache`      | `ErrNotFound`               | Key missing or expired                |
+| `cache`      | `ErrInvalidKey`             | Empty key string                      |
+| `cache`      | `ErrInvalidTTL`             | TTL ≤ 0                               |
+| `cache`      | `ErrInvalidCleanupInterval` | CleanupInterval ≤ 0                   |
+| `cache`      | `ErrInvalidMaxSize`         | MaxSize ≤ 0                           |
+| `cache`      | `ErrInvalidMaxMemory`       | MaxMemoryMB ≤ 0                       |
+| `cache`      | `ErrEntryTooLarge`          | Entry exceeds `MaxMemoryMB` (evicted) |
+| `client`     | `ErrCircuitOpen`            | Circuit breaker is open               |
+| `middleware`  | `ErrRateLimitExceeded`      | Rate limit bucket exhausted           |
 
 ---
 

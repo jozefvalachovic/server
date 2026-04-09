@@ -182,3 +182,69 @@ func TestRateLimit_NoConfig_UsesDefaults(t *testing.T) {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 }
+
+func TestRateLimit_RetryAfterHeader(t *testing.T) {
+	handler := HTTPRateLimit(HTTPRateLimitConfig{
+		RequestsPerSecond: 2,
+		Burst:             1,
+	})(rateLimitOKHandler)
+
+	ip := "10.0.0.10:1234"
+	call := func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = ip
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	call() // exhaust burst
+	rec := call()
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", rec.Code)
+	}
+	ra := rec.Header().Get("Retry-After")
+	if ra == "" {
+		t.Fatal("expected Retry-After header on 429 response")
+	}
+	if ra != "1" {
+		// ceil(1/2) = 1
+		t.Fatalf("expected Retry-After '1', got %q", ra)
+	}
+}
+
+func TestRateLimit_RetryAfterHeader_SubSecondRate(t *testing.T) {
+	handler := HTTPRateLimit(HTTPRateLimitConfig{
+		RequestsPerSecond: 0.5, // 1 request per 2 seconds
+		Burst:             1,
+	})(rateLimitOKHandler)
+
+	ip := "10.0.0.11:1234"
+	call := func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = ip
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	call()
+	rec := call()
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", rec.Code)
+	}
+	ra := rec.Header().Get("Retry-After")
+	if ra != "2" {
+		// ceil(1/0.5) = 2
+		t.Fatalf("expected Retry-After '2', got %q", ra)
+	}
+}
+
+func TestErrRateLimitExceeded_IsSentinel(t *testing.T) {
+	if ErrRateLimitExceeded == nil {
+		t.Fatal("ErrRateLimitExceeded should not be nil")
+	}
+	if ErrRateLimitExceeded.Error() == "" {
+		t.Fatal("ErrRateLimitExceeded should have a message")
+	}
+}

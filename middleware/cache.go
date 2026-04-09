@@ -207,6 +207,11 @@ func HTTPCache(cfg HTTPCacheConfig) func(http.Handler) http.Handler {
 			}
 
 			// Honour explicit client opt-out (handles "no-store", "no-cache, no-store", etc.).
+			//
+			// RFC 7234 §5.2.1.4 "no-cache" semantics (revalidation) are intentionally
+			// not implemented: this cache has no ETag/Last-Modified revalidation support.
+			// Clients that send "no-cache" without "no-store" will still receive cached
+			// responses. Use "Cache-Control: no-store" for guaranteed bypass.
 			if strings.Contains(r.Header.Get("Cache-Control"), "no-store") {
 				next.ServeHTTP(w, r)
 				return

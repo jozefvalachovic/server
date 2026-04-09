@@ -3,6 +3,7 @@ package cache
 import (
 	"container/heap"
 	"errors"
+	"hash/maphash"
 	"net/http"
 	"slices"
 	"strings"
@@ -86,14 +87,27 @@ type CachedResponse struct {
 	Body       []byte      `json:"body"`
 }
 
-// CacheStore provides thread-safe caching with TTL and size limits
-type CacheStore struct {
+const cacheShards = 16
+
+// cacheShard holds one partition of the cache data. Each shard has its own
+// lock, data map, prefix index, and eviction heap so that concurrent
+// operations on different keys rarely contend on the same mutex.
+type cacheShard struct {
 	mu          sync.RWMutex
 	data        map[string]cacheEntry
-	prefixIndex map[string]map[string]struct{} // prefix → set of keys; enables O(k) prefix invalidation
-	evictQ      evictHeap                      // min-heap ordered by createdAt for O(log n) eviction
-	heapIndex   map[string]*evictHeapEntry     // key → heap entry; enables O(log n) arbitrary removal
-	config      CacheConfig
+	prefixIndex map[string]map[string]struct{} // prefix → set of keys
+	evictQ      evictHeap                      // min-heap ordered by createdAt
+	heapIndex   map[string]*evictHeapEntry     // key → heap entry
+}
+
+// CacheStore provides thread-safe caching with TTL and size limits.
+// Internally it partitions data across 16 shards (like the rate limiter)
+// so that concurrent Set/Get/Delete calls on different keys contend on
+// independent mutexes.
+type CacheStore struct {
+	shards [cacheShards]cacheShard
+	seed   maphash.Seed
+	config CacheConfig
 
 	// Counters — all updated and read atomically; no lock required.
 	hits      atomic.Int64
@@ -101,11 +115,17 @@ type CacheStore struct {
 	sets      atomic.Int64
 	deletes   atomic.Int64
 	evictions atomic.Int64
-	size      atomic.Int64 // tracks len(data)
+	size      atomic.Int64 // tracks total entry count across all shards
 	bytesUsed atomic.Int64 // estimated total bytes across all stored values
 
 	stopCh   chan struct{} // closed by Stop() to terminate the cleanup goroutine
 	stopOnce sync.Once     // ensures Stop() is safe to call multiple times
+}
+
+// shardFor returns the shard that owns the given key.
+func (cs *CacheStore) shardFor(key string) *cacheShard {
+	h := maphash.Bytes(cs.seed, []byte(key))
+	return &cs.shards[h%cacheShards]
 }
 
 type cacheEntry struct {
@@ -133,12 +153,17 @@ func NewCacheStore(cfg CacheConfig) (*CacheStore, error) {
 		return nil, ErrInvalidMaxMemory
 	}
 	cs := &CacheStore{
-		data:        make(map[string]cacheEntry),
-		prefixIndex: make(map[string]map[string]struct{}),
-		evictQ:      evictHeap{},
-		heapIndex:   make(map[string]*evictHeapEntry),
-		stopCh:      make(chan struct{}),
-		config:      cfg,
+		seed:   maphash.MakeSeed(),
+		stopCh: make(chan struct{}),
+		config: cfg,
+	}
+	for i := range cs.shards {
+		cs.shards[i] = cacheShard{
+			data:        make(map[string]cacheEntry),
+			prefixIndex: make(map[string]map[string]struct{}),
+			evictQ:      evictHeap{},
+			heapIndex:   make(map[string]*evictHeapEntry),
+		}
 	}
 	go cs.cleanupLoop()
 	return cs, nil
@@ -158,15 +183,20 @@ func (cs *CacheStore) Set(key string, value any, customTtl *time.Duration) error
 		return ErrInvalidTTL
 	}
 
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
+	s := cs.shardFor(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// ── Enforce entry-count limit ────────────────────────────────────────
-	for cs.config.MaxSize > 0 && len(cs.data) >= cs.config.MaxSize {
-		if len(cs.evictQ) == 0 {
-			break // defensive: heap empty but data remains — avoid infinite loop
+	for cs.config.MaxSize > 0 && cs.size.Load() >= int64(cs.config.MaxSize) {
+		if len(s.evictQ) == 0 {
+			// Current shard has nothing to evict; try other shards.
+			if !cs.evictFromOtherShard(s) {
+				break
+			}
+			continue
 		}
-		cs.evictOldest()
+		cs.evictOldestFromShardLocked(s)
 	}
 
 	now := time.Now()
@@ -175,11 +205,11 @@ func (cs *CacheStore) Set(key string, value any, customTtl *time.Duration) error
 
 	// ── Enforce byte-level memory limit before insert ────────────────────
 	memLimit := int64(cs.config.MaxMemoryMB) * 1024 * 1024
-	for cs.bytesUsed.Load()+entryBytes > memLimit && len(cs.data) > 0 {
-		if len(cs.evictQ) == 0 {
+	for cs.bytesUsed.Load()+entryBytes > memLimit && len(s.data) > 0 {
+		if len(s.evictQ) == 0 {
 			break // defensive: heap empty — avoid infinite loop
 		}
-		cs.evictOldest()
+		cs.evictOldestFromShardLocked(s)
 	}
 	// If the entry alone exceeds the budget, reject immediately.
 	if cs.bytesUsed.Load()+entryBytes > memLimit {
@@ -189,12 +219,12 @@ func (cs *CacheStore) Set(key string, value any, customTtl *time.Duration) error
 	// Store entry, adjusting byte accounting for updates vs new insertions.
 	// Preserve the original createdAt on updates so that hot (frequently
 	// refreshed) keys are not permanently pinned against eviction.
-	existing, alreadyExists := cs.data[key]
+	existing, alreadyExists := s.data[key]
 	createdAt := now
 	if alreadyExists {
 		createdAt = existing.createdAt
 	}
-	cs.data[key] = cacheEntry{
+	s.data[key] = cacheEntry{
 		value:     value,
 		createdAt: createdAt,
 		expiresAt: expiresAt,
@@ -205,21 +235,21 @@ func (cs *CacheStore) Set(key string, value any, customTtl *time.Duration) error
 	} else {
 		cs.size.Add(1)
 		cs.bytesUsed.Add(entryBytes)
-		cs.indexKey(key)
+		s.indexKey(key)
 		// Register in the eviction heap. Existing entries keep their original
 		// heap position (createdAt is preserved on update, so order is stable).
 		heapEntry := &evictHeapEntry{key: key, createdAt: createdAt}
-		heap.Push(&cs.evictQ, heapEntry)
-		cs.heapIndex[key] = heapEntry
+		heap.Push(&s.evictQ, heapEntry)
+		s.heapIndex[key] = heapEntry
 	}
 
 	// ── 90 % threshold warnings ──────────────────────────────────────────
 	// Logged at Trace level because this fires on every Set() above 90%
 	// capacity — normal operating state for a properly-sized cache.
-	sizeRatio := float64(len(cs.data)) / float64(cs.config.MaxSize)
+	sizeRatio := float64(cs.size.Load()) / float64(cs.config.MaxSize)
 	if sizeRatio >= 0.9 {
 		logger.LogTrace("Cache nearing entry-count limit",
-			"size", len(cs.data), "maxSize", cs.config.MaxSize,
+			"size", cs.size.Load(), "maxSize", cs.config.MaxSize,
 			"usagePct", int(sizeRatio*100))
 	}
 	memUsed := cs.bytesUsed.Load()
@@ -236,52 +266,54 @@ func (cs *CacheStore) Set(key string, value any, customTtl *time.Duration) error
 
 // Get retrieves a value from cache.
 // Returns ErrNotFound if the key does not exist or has expired.
-func (c *CacheStore) Get(key string) (any, error) {
-	c.mu.RLock()
-	entry, exists := c.data[key]
-	c.mu.RUnlock()
+func (cs *CacheStore) Get(key string) (any, error) {
+	s := cs.shardFor(key)
+	s.mu.RLock()
+	entry, exists := s.data[key]
+	s.mu.RUnlock()
 
 	if !exists {
-		c.misses.Add(1)
+		cs.misses.Add(1)
 		return nil, ErrNotFound
 	}
 
 	if time.Now().After(entry.expiresAt) {
-		c.misses.Add(1)
+		cs.misses.Add(1)
 		// Lazy delete: attempt a non-blocking write lock so the expired
 		// entry is removed immediately when there is no contention.
 		// If TryLock fails another goroutine holds the lock and the
 		// periodic cleanup will collect the entry instead.
-		if c.mu.TryLock() {
-			if e, ok := c.data[key]; ok && time.Now().After(e.expiresAt) {
-				delete(c.data, key)
-				c.unindexKey(key)
-				c.removeFromHeap(key)
-				c.size.Add(-1)
-				c.bytesUsed.Add(-e.bytes)
+		if s.mu.TryLock() {
+			if e, ok := s.data[key]; ok && time.Now().After(e.expiresAt) {
+				delete(s.data, key)
+				s.unindexKey(key)
+				s.removeFromHeap(key)
+				cs.size.Add(-1)
+				cs.bytesUsed.Add(-e.bytes)
 			}
-			c.mu.Unlock()
+			s.mu.Unlock()
 		}
 		return nil, ErrNotFound
 	}
 
-	c.hits.Add(1)
+	cs.hits.Add(1)
 	return entry.value, nil
 }
 
 // Delete removes a value from cache
 func (cs *CacheStore) Delete(key string) bool {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
+	s := cs.shardFor(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	entry, exists := cs.data[key]
+	entry, exists := s.data[key]
 	if !exists {
 		return false
 	}
 
-	delete(cs.data, key)
-	cs.unindexKey(key)
-	cs.removeFromHeap(key)
+	delete(s.data, key)
+	s.unindexKey(key)
+	s.removeFromHeap(key)
 	cs.size.Add(-1)
 	cs.bytesUsed.Add(-entry.bytes)
 
@@ -292,22 +324,22 @@ func (cs *CacheStore) Delete(key string) bool {
 }
 
 // Flush clears all cache data
-func (c *CacheStore) Flush() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Count the entries being flushed so that GetStats().Deletes stays accurate.
-	n := int64(len(c.data))
-
-	// Clear maps
-	c.data = make(map[string]cacheEntry)
-	c.prefixIndex = make(map[string]map[string]struct{})
-	c.evictQ = evictHeap{}
-	c.heapIndex = make(map[string]*evictHeapEntry)
-	c.size.Store(0)
-	c.bytesUsed.Store(0)
-	if n > 0 {
-		c.deletes.Add(n)
+func (cs *CacheStore) Flush() {
+	var total int64
+	for i := range cs.shards {
+		s := &cs.shards[i]
+		s.mu.Lock()
+		total += int64(len(s.data))
+		s.data = make(map[string]cacheEntry)
+		s.prefixIndex = make(map[string]map[string]struct{})
+		s.evictQ = evictHeap{}
+		s.heapIndex = make(map[string]*evictHeapEntry)
+		s.mu.Unlock()
+	}
+	cs.size.Store(0)
+	cs.bytesUsed.Store(0)
+	if total > 0 {
+		cs.deletes.Add(total)
 	}
 
 	logger.LogInfo("Cache flushed")
@@ -329,43 +361,68 @@ func (cs *CacheStore) GetStats() CacheStats {
 
 // Export returns all cache data for debugging
 func (cs *CacheStore) Export() map[string]any {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-
 	exported := make(map[string]any)
-	for key, entry := range cs.data {
-		exported[key] = map[string]any{
-			"value":     entry.value,
-			"createdAt": entry.createdAt,
-			"expiresAt": entry.expiresAt,
-			"ttl":       time.Until(entry.expiresAt),
+	for i := range cs.shards {
+		s := &cs.shards[i]
+		s.mu.RLock()
+		for key, entry := range s.data {
+			exported[key] = map[string]any{
+				"value":     entry.value,
+				"createdAt": entry.createdAt,
+				"expiresAt": entry.expiresAt,
+				"ttl":       time.Until(entry.expiresAt),
+			}
 		}
+		s.mu.RUnlock()
 	}
 
 	return exported
 }
 
-// evictOldest removes the entry with the earliest createdAt while holding
-// the write lock. Uses the min-heap for O(log n) time instead of a full scan.
-func (cs *CacheStore) evictOldest() {
-	if len(cs.evictQ) == 0 {
+// evictOldestFromShardLocked removes the entry with the earliest createdAt
+// from the given shard. The caller must hold s.mu in write mode.
+// Uses the min-heap for O(log n) time instead of a full scan.
+func (cs *CacheStore) evictOldestFromShardLocked(s *cacheShard) {
+	if len(s.evictQ) == 0 {
 		return
 	}
 
-	e := heap.Pop(&cs.evictQ).(*evictHeapEntry)
-	delete(cs.heapIndex, e.key)
+	e := heap.Pop(&s.evictQ).(*evictHeapEntry)
+	delete(s.heapIndex, e.key)
 
-	oldestEntry, exists := cs.data[e.key]
+	oldestEntry, exists := s.data[e.key]
 	if !exists {
 		return
 	}
-	delete(cs.data, e.key)
-	cs.unindexKey(e.key)
+	delete(s.data, e.key)
+	s.unindexKey(e.key)
 	cs.size.Add(-1)
 	cs.bytesUsed.Add(-oldestEntry.bytes)
 	cs.evictions.Add(1)
 
 	logger.LogTrace("Cache evicted oldest entry", "key", e.key)
+}
+
+// evictFromOtherShard tries to evict one entry from any shard other than
+// exclude. It uses TryLock to avoid deadlocking when the caller already
+// holds exclude.mu. Returns true if an entry was evicted.
+func (cs *CacheStore) evictFromOtherShard(exclude *cacheShard) bool {
+	for i := range cs.shards {
+		other := &cs.shards[i]
+		if other == exclude {
+			continue
+		}
+		if !other.mu.TryLock() {
+			continue // skip busy shards to avoid deadlock
+		}
+		if len(other.evictQ) > 0 {
+			cs.evictOldestFromShardLocked(other)
+			other.mu.Unlock()
+			return true
+		}
+		other.mu.Unlock()
+	}
+	return false
 }
 
 // cleanupLoop periodically removes expired entries.
@@ -382,9 +439,7 @@ func (cs *CacheStore) cleanupLoop() {
 			// space that now lets over-limit entries remain (e.g. after a burst).
 			if cs.config.MaxMemoryMB > 0 &&
 				cs.bytesUsed.Load() > int64(cs.config.MaxMemoryMB)*1024*1024 {
-				cs.mu.Lock()
-				cs.trimToMemoryLimitLocked()
-				cs.mu.Unlock()
+				cs.trimToMemoryLimit()
 			}
 		case <-cs.stopCh:
 			return
@@ -400,126 +455,130 @@ func (cs *CacheStore) Stop() {
 	})
 }
 
-// cleanupExpired removes expired entries.
-// The scan runs under an RLock to collect up to cleanupBatchSize expired keys,
-// then a brief Lock deletes them. This bounds the critical section so that
-// large caches do not stall writers for the full O(n) scan. If more expired
-// entries remain, the next ticker cycle will continue.
+// cleanupExpired removes expired entries shard by shard.
+// Each shard is locked independently so that large caches do not stall
+// writers while the full store is scanned.
 func (cs *CacheStore) cleanupExpired() {
 	const cleanupBatchSize = 512
 
 	now := time.Now()
 
-	// Phase 1: collect stale keys under RLock.
-	cs.mu.RLock()
-	expiredKeys := make([]string, 0, min(cleanupBatchSize, len(cs.data)))
-	for key, entry := range cs.data {
-		if now.After(entry.expiresAt) {
-			expiredKeys = append(expiredKeys, key)
-			if len(expiredKeys) >= cleanupBatchSize {
-				break
+	for i := range cs.shards {
+		s := &cs.shards[i]
+
+		// Phase 1: collect stale keys under RLock.
+		s.mu.RLock()
+		expiredKeys := make([]string, 0, min(cleanupBatchSize, len(s.data)))
+		for key, entry := range s.data {
+			if now.After(entry.expiresAt) {
+				expiredKeys = append(expiredKeys, key)
+				if len(expiredKeys) >= cleanupBatchSize {
+					break
+				}
 			}
 		}
-	}
-	cs.mu.RUnlock()
+		s.mu.RUnlock()
 
-	if len(expiredKeys) == 0 {
-		return
-	}
-
-	// Phase 2: delete collected keys under Lock.
-	cs.mu.Lock()
-	var expiredBytes int64
-	deleted := 0
-	for _, key := range expiredKeys {
-		entry, exists := cs.data[key]
-		if !exists {
-			continue // deleted between phases
-		}
-		// Re-check expiry — entry may have been refreshed between phases.
-		if !now.After(entry.expiresAt) {
+		if len(expiredKeys) == 0 {
 			continue
 		}
-		expiredBytes += entry.bytes
-		delete(cs.data, key)
-		cs.unindexKey(key)
-		cs.removeFromHeap(key)
-		deleted++
-	}
-	if deleted > 0 {
-		cs.size.Add(-int64(deleted))
-		cs.bytesUsed.Add(-expiredBytes)
-		cs.deletes.Add(int64(deleted))
-		// Reclaim excess heap capacity after batch eviction so the backing
-		// array does not retain its peak allocation indefinitely.
-		cs.evictQ = slices.Clip(cs.evictQ)
-	}
-	cs.mu.Unlock()
 
-	if deleted > 0 {
-		logger.LogTrace("Cache cleanup", "expired", deleted)
+		// Phase 2: delete collected keys under Lock.
+		s.mu.Lock()
+		var expiredBytes int64
+		deleted := 0
+		for _, key := range expiredKeys {
+			entry, exists := s.data[key]
+			if !exists {
+				continue // deleted between phases
+			}
+			// Re-check expiry — entry may have been refreshed between phases.
+			if !now.After(entry.expiresAt) {
+				continue
+			}
+			expiredBytes += entry.bytes
+			delete(s.data, key)
+			s.unindexKey(key)
+			s.removeFromHeap(key)
+			deleted++
+		}
+		if deleted > 0 {
+			cs.size.Add(-int64(deleted))
+			cs.bytesUsed.Add(-expiredBytes)
+			cs.deletes.Add(int64(deleted))
+			// Reclaim excess heap capacity after batch eviction so the backing
+			// array does not retain its peak allocation indefinitely.
+			s.evictQ = slices.Clip(s.evictQ)
+		}
+		s.mu.Unlock()
+
+		if deleted > 0 {
+			logger.LogTrace("Cache cleanup", "shard", i, "expired", deleted)
+		}
 	}
 }
 
 // DeleteByPrefix removes all cache entries whose key begins with the given
 // prefix (i.e. the portion before the first ':', e.g. "u42_products").
 // Returns the number of entries deleted.
-// This is O(k) in the number of matching keys, not O(n) in the total store size.
+// Each shard's prefix index is checked independently.
 func (cs *CacheStore) DeleteByPrefix(prefix string) int {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-
-	keys := cs.prefixIndex[prefix]
-	if len(keys) == 0 {
-		return 0
-	}
-
-	count := 0
+	total := 0
 	var totalBytes int64
-	for key := range keys {
-		if entry, exists := cs.data[key]; exists {
-			totalBytes += entry.bytes
-			delete(cs.data, key)
-			cs.removeFromHeap(key)
-			count++
+	for i := range cs.shards {
+		s := &cs.shards[i]
+		s.mu.Lock()
+		keys := s.prefixIndex[prefix]
+		if len(keys) > 0 {
+			for key := range keys {
+				if entry, exists := s.data[key]; exists {
+					totalBytes += entry.bytes
+					delete(s.data, key)
+					s.removeFromHeap(key)
+					total++
+				}
+			}
+			delete(s.prefixIndex, prefix)
 		}
+		s.mu.Unlock()
 	}
-	delete(cs.prefixIndex, prefix)
-	cs.size.Add(-int64(count))
-	cs.bytesUsed.Add(-totalBytes)
-	cs.deletes.Add(int64(count))
+	if total > 0 {
+		cs.size.Add(-int64(total))
+		cs.bytesUsed.Add(-totalBytes)
+		cs.deletes.Add(int64(total))
+	}
 
-	return count
+	return total
 }
 
 // removeFromHeap removes the heap entry for key in O(log n) using the stored
-// index. Must be called while holding the write lock.
-func (cs *CacheStore) removeFromHeap(key string) {
-	e, ok := cs.heapIndex[key]
+// index. Must be called while holding the shard's write lock.
+func (s *cacheShard) removeFromHeap(key string) {
+	e, ok := s.heapIndex[key]
 	if !ok {
 		return
 	}
-	if e.index >= 0 && e.index < len(cs.evictQ) {
-		heap.Remove(&cs.evictQ, e.index)
+	if e.index >= 0 && e.index < len(s.evictQ) {
+		heap.Remove(&s.evictQ, e.index)
 	}
-	delete(cs.heapIndex, key)
+	delete(s.heapIndex, key)
 }
 
-// indexKey adds key to the prefix index. Called while holding the write lock.
-func (cs *CacheStore) indexKey(key string) {
+// indexKey adds key to the shard's prefix index. Called while holding the write lock.
+func (s *cacheShard) indexKey(key string) {
 	p := cacheKeyPrefix(key)
-	if cs.prefixIndex[p] == nil {
-		cs.prefixIndex[p] = make(map[string]struct{})
+	if s.prefixIndex[p] == nil {
+		s.prefixIndex[p] = make(map[string]struct{})
 	}
-	cs.prefixIndex[p][key] = struct{}{}
+	s.prefixIndex[p][key] = struct{}{}
 }
 
-// unindexKey removes key from the prefix index. Called while holding the write lock.
-func (cs *CacheStore) unindexKey(key string) {
+// unindexKey removes key from the shard's prefix index. Called while holding the write lock.
+func (s *cacheShard) unindexKey(key string) {
 	p := cacheKeyPrefix(key)
-	delete(cs.prefixIndex[p], key)
-	if len(cs.prefixIndex[p]) == 0 {
-		delete(cs.prefixIndex, p)
+	delete(s.prefixIndex[p], key)
+	if len(s.prefixIndex[p]) == 0 {
+		delete(s.prefixIndex, p)
 	}
 }
 
@@ -532,16 +591,29 @@ func cacheKeyPrefix(key string) string {
 	return key
 }
 
-// trimToMemoryLimitLocked evicts the oldest entries until bytesUsed falls
-// below the configured MaxMemoryMB limit. Must be called while holding the
-// write lock (cs.mu).
-func (cs *CacheStore) trimToMemoryLimitLocked() {
+// trimToMemoryLimit evicts the oldest entries across shards in round-robin
+// fashion until bytesUsed falls below the configured MaxMemoryMB limit.
+func (cs *CacheStore) trimToMemoryLimit() {
 	limit := int64(cs.config.MaxMemoryMB) * 1024 * 1024
-	for cs.bytesUsed.Load() > limit && len(cs.data) > 0 {
-		cs.evictOldest()
+	for cs.bytesUsed.Load() > limit {
+		evicted := false
+		for i := range cs.shards {
+			if cs.bytesUsed.Load() <= limit {
+				return
+			}
+			s := &cs.shards[i]
+			s.mu.Lock()
+			if len(s.evictQ) > 0 {
+				cs.evictOldestFromShardLocked(s)
+				s.evictQ = slices.Clip(s.evictQ)
+				evicted = true
+			}
+			s.mu.Unlock()
+		}
+		if !evicted {
+			break // nothing left to evict
+		}
 	}
-	// Reclaim excess heap capacity after bulk eviction.
-	cs.evictQ = slices.Clip(cs.evictQ)
 }
 
 // estimateBytes returns a rough byte estimate for the given key-value pair.

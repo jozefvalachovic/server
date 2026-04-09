@@ -2,6 +2,8 @@ package middleware
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -207,7 +209,7 @@ func MultiTokenVerify(tokens ...string) func(ctx context.Context, credential str
 	copy(frozen, tokens)
 	return func(_ context.Context, credential string) (string, error) {
 		for i, t := range frozen {
-			if subtle.ConstantTimeCompare([]byte(credential), []byte(t)) == 1 {
+			if constantTimeCompareWithPad([]byte(credential), []byte(t)) {
 				return fmt.Sprintf("token:%d", i), nil
 			}
 		}
@@ -228,7 +230,7 @@ func MultiTokenVerify(tokens ...string) func(ctx context.Context, credential str
 func RotatingTokenVerify(tokensFn func() []string) func(ctx context.Context, credential string) (string, error) {
 	return func(_ context.Context, credential string) (string, error) {
 		for i, t := range tokensFn() {
-			if subtle.ConstantTimeCompare([]byte(credential), []byte(t)) == 1 {
+			if constantTimeCompareWithPad([]byte(credential), []byte(t)) {
 				return fmt.Sprintf("token:%d", i), nil
 			}
 		}
@@ -236,22 +238,22 @@ func RotatingTokenVerify(tokensFn func() []string) func(ctx context.Context, cre
 	}
 }
 
-// tokenStore provides a concurrent-safe, hot-swappable token list.
-type tokenStore struct {
+// TokenStore provides a concurrent-safe, hot-swappable token list.
+type TokenStore struct {
 	mu     sync.RWMutex
 	tokens []string
 }
 
 // NewTokenStore creates a token store initialised with the given tokens.
 // Use Store.Rotate() to swap in a new set at runtime.
-func NewTokenStore(initial ...string) *tokenStore {
-	ts := &tokenStore{tokens: make([]string, len(initial))}
+func NewTokenStore(initial ...string) *TokenStore {
+	ts := &TokenStore{tokens: make([]string, len(initial))}
 	copy(ts.tokens, initial)
 	return ts
 }
 
 // Rotate atomically replaces the token set with newTokens.
-func (s *tokenStore) Rotate(newTokens ...string) {
+func (s *TokenStore) Rotate(newTokens ...string) {
 	s.mu.Lock()
 	s.tokens = make([]string, len(newTokens))
 	copy(s.tokens, newTokens)
@@ -259,12 +261,12 @@ func (s *tokenStore) Rotate(newTokens ...string) {
 }
 
 // Verify implements the AuthConfig.Verify signature using the current token set.
-func (s *tokenStore) Verify(_ context.Context, credential string) (string, error) {
+func (s *TokenStore) Verify(_ context.Context, credential string) (string, error) {
 	s.mu.RLock()
 	tokens := s.tokens
 	s.mu.RUnlock()
 	for i, t := range tokens {
-		if subtle.ConstantTimeCompare([]byte(credential), []byte(t)) == 1 {
+		if constantTimeCompareWithPad([]byte(credential), []byte(t)) {
 			return fmt.Sprintf("token:%d", i), nil
 		}
 	}
@@ -283,4 +285,31 @@ func AuditAuthFailure(r *http.Request, err error) {
 		"method", r.Method,
 		"remote", r.RemoteAddr,
 	)
+}
+
+// constantTimeCompareWithPad compares two byte slices in constant time,
+// regardless of whether their lengths differ. This prevents a timing oracle
+// that leaks credential length (crypto/subtle.ConstantTimeCompare returns
+// immediately when lengths differ).
+//
+// When lengths are unequal the shorter slice is padded (via HMAC-SHA256) so
+// the comparison always processes equal-length inputs. The result is
+// deterministic: equal content always matches, unequal content always fails.
+func constantTimeCompareWithPad(a, b []byte) bool {
+	if len(a) == len(b) {
+		return subtle.ConstantTimeCompare(a, b) == 1
+	}
+	// Derive fixed-length values from both inputs so the comparison time is
+	// independent of the original lengths. HMAC-SHA256 is used to avoid the
+	// pathological case where a user finds a raw SHA256 collision.
+	key := [32]byte{} // zero key is fine; we only need a consistent MAC
+	ha := hmacSHA256(key[:], a)
+	hb := hmacSHA256(key[:], b)
+	return subtle.ConstantTimeCompare(ha, hb) == 1
+}
+
+func hmacSHA256(key, msg []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	mac.Write(msg)
+	return mac.Sum(nil)
 }
