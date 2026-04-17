@@ -1118,7 +1118,7 @@ routes.RegisterSwagger(mux, "/docs", swagger.Config{
 
 > **Internal package** (`internal/admin`) — not directly importable. Configured via `server.AdminConfig`.
 
-Password-protected admin UI with per-route metrics and cache explorer. Requires `ADMIN_NAME` and `ADMIN_SECRET` environment variables.
+Password-protected admin UI with per-route metrics and cache explorer. Requires `ADMIN_NAME`, `ADMIN_SECRET`, and `ADMIN_SIGNING_KEY` environment variables.
 
 ```go
 // Automatic wiring via HTTPServerConfig:
@@ -1142,7 +1142,7 @@ When `Admin` is set, `NewHTTPServer` creates a `Collector`, registers all admin 
 | `/metrics/auth` | Login page for the metrics section           |
 | `/cache/auth`   | Login page for the cache section             |
 
-Session-based HMAC-SHA256 auth with 8-hour TTL cookie. Login attempts are rate-limited to 5 per IP address within a 15-minute window. A background janitor goroutine sweeps stale entries every 15 minutes to prevent unbounded memory growth from rotated source IPs.
+Session-based HMAC-SHA256 auth with 8-hour TTL cookie. `ADMIN_SECRET` is the login password — it is hashed with PBKDF2-SHA256 at startup and never stored in plaintext. `ADMIN_SIGNING_KEY` is used exclusively for HMAC session/CSRF cookie signing, so compromise of one secret does not expose the other. Login attempts are rate-limited to 5 per IP address within a 15-minute window. A background janitor goroutine sweeps stale entries every 15 minutes to prevent unbounded memory growth from rotated source IPs.
 
 **Standalone usage** (without `NewHTTPServer`):
 
@@ -1275,7 +1275,8 @@ if errors.Is(err, middleware.ErrRateLimitExceeded) {
 | `METRICS_HOST`        | server     | no          | Metrics bind address (default: 127.0.0.1) |
 | `METRICS_PORT`        | server     | for metrics | Metrics server port                       |
 | `ADMIN_NAME`          | admin      | for admin   | Admin UI username                         |
-| `ADMIN_SECRET`        | admin      | for admin   | Admin UI password / HMAC key              |
+| `ADMIN_SECRET`        | admin      | for admin   | Admin UI password (PBKDF2-hashed at startup) |
+| `ADMIN_SIGNING_KEY`   | admin      | for admin   | HMAC key for session / CSRF signing       |
 | `MAX_REQUEST_SIZE_MB` | middleware | no          | Body size limit override (default: 10)    |
 | `ENV`                 | middleware | no          | Set to `production` for HSTS header       |
 | `DEV`                 | watch      | no          | Set to `1` to enable hot-reload           |

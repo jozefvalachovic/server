@@ -7,12 +7,15 @@
 //
 // Authentication is form-based. A signed HMAC-SHA256 session cookie
 // (_admin_session) is valid for 8 hours. The cookie covers all sections;
-// signing is keyed on ADMIN_SECRET so the server holds no session state.
+// signing is keyed on ADMIN_SIGNING_KEY so the server holds no session state.
+// The login password (ADMIN_SECRET) is hashed with PBKDF2-SHA256 at startup;
+// only the derived hash is kept in memory.
 //
 // Environment variables required:
 //
-//	ADMIN_NAME    — admin username
-//	ADMIN_SECRET  — admin password / HMAC signing key
+//	ADMIN_NAME        — admin username
+//	ADMIN_SECRET      — admin password (hashed at startup, never stored in plaintext)
+//	ADMIN_SIGNING_KEY — HMAC key for session / CSRF cookie signing (must differ from ADMIN_SECRET)
 //
 // Usage:
 //
@@ -101,10 +104,16 @@ func Register(mux *http.ServeMux, cfg Config) {
 	// keep the existing signatures; admin is not re-entrant so this is safe.
 	trustXFP = cfg.TrustXForwardedProto
 
-	// Warn operators when the admin secret is too short to resist brute-force
-	// attacks on the HMAC-SHA256 session cookie.
-	if _, secret := adminCreds(); secret != "" && len(secret) < 32 {
+	// Hash the plaintext ADMIN_SECRET with PBKDF2 so the raw password is
+	// not retained in package state after bootstrap.
+	initPasswordStore()
+
+	// Warn operators when secrets are too short to resist brute-force.
+	if secret := os.Getenv("ADMIN_SECRET"); secret != "" && len(secret) < 32 {
 		fmt.Fprintf(os.Stderr, "WARNING: ADMIN_SECRET is only %d characters; use at least 32 for adequate security\n", len(secret))
+	}
+	if sigKey := adminSigningKey(); sigKey != "" && len(sigKey) < 32 {
+		fmt.Fprintf(os.Stderr, "WARNING: ADMIN_SIGNING_KEY is only %d characters; use at least 32 for adequate security\n", len(sigKey))
 	}
 
 	// ── Static assets ────────────────────────────────────────────────────

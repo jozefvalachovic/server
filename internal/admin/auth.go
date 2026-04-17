@@ -3,6 +3,7 @@ package admin
 import (
 	"cmp"
 	"crypto/hmac"
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -47,9 +48,63 @@ func isSecureRequest(r *http.Request) bool {
 	return false
 }
 
-// adminCreds returns the configured ADMIN_NAME and ADMIN_SECRET from env.
-func adminCreds() (name, secret string) {
-	return os.Getenv("ADMIN_NAME"), os.Getenv("ADMIN_SECRET")
+// adminName returns the configured ADMIN_NAME from env.
+func adminName() string { return os.Getenv("ADMIN_NAME") }
+
+// adminSigningKey returns the ADMIN_SIGNING_KEY used exclusively for
+// HMAC-SHA256 session cookie and CSRF token signing. This is deliberately
+// separate from ADMIN_SECRET (the login password) so that compromise of
+// one does not expose the other.
+func adminSigningKey() string { return os.Getenv("ADMIN_SIGNING_KEY") }
+
+// ── Password store ───────────────────────────────────────────────────────────
+//
+// At startup the plaintext ADMIN_SECRET is hashed with PBKDF2-SHA256 and a
+// random per-process salt. Only the derived hash and the salt are retained;
+// the raw password is never stored in package state. Login attempts recompute
+// the PBKDF2 derivation and compare in constant time.
+
+const (
+	pbkdf2Iter   = 210_000 // OWASP recommendation range for SHA-256
+	pbkdf2KeyLen = 32
+)
+
+var pwStore struct {
+	mu   sync.Mutex
+	hash []byte
+	salt []byte
+}
+
+// initPasswordStore hashes ADMIN_SECRET with PBKDF2-SHA256 and a fresh
+// random salt, then stores the result in pwStore. Safe to call more than
+// once (tests call it after each t.Setenv).
+func initPasswordStore() {
+	secret := os.Getenv("ADMIN_SECRET")
+	pwStore.mu.Lock()
+	defer pwStore.mu.Unlock()
+	if secret == "" {
+		pwStore.hash = nil
+		pwStore.salt = nil
+		return
+	}
+	salt := make([]byte, 16)
+	_, _ = rand.Read(salt)
+	pwStore.salt = salt
+	h, _ := pbkdf2.Key(sha256.New, secret, salt, pbkdf2Iter, pbkdf2KeyLen)
+	pwStore.hash = h
+}
+
+// verifyPassword returns true when input matches the PBKDF2 hash computed
+// at startup. The comparison is constant-time.
+func verifyPassword(input string) bool {
+	pwStore.mu.Lock()
+	hash, salt := pwStore.hash, pwStore.salt
+	pwStore.mu.Unlock()
+	if hash == nil {
+		return false
+	}
+	candidate, _ := pbkdf2.Key(sha256.New, input, salt, pbkdf2Iter, pbkdf2KeyLen)
+	return subtle.ConstantTimeCompare(candidate, hash) == 1
 }
 
 // makeToken creates a signed session token:
@@ -94,17 +149,39 @@ func signMAC(secret, msg string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// constantTimeCompareWithPad compares two byte slices in constant time,
+// regardless of whether their lengths differ. crypto/subtle.ConstantTimeCompare
+// returns immediately when lengths differ, leaking length information via a
+// timing side-channel. When lengths are unequal the shorter slice is padded
+// (via HMAC-SHA256) so the comparison always processes equal-length inputs.
+func constantTimeCompareWithPad(a, b []byte) bool {
+	if len(a) == len(b) {
+		return subtle.ConstantTimeCompare(a, b) == 1
+	}
+	key := [32]byte{}
+	ha := hmacDigest(key[:], a)
+	hb := hmacDigest(key[:], b)
+	return subtle.ConstantTimeCompare(ha, hb) == 1
+}
+
+func hmacDigest(key, msg []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	mac.Write(msg)
+	return mac.Sum(nil)
+}
+
 // isAuthenticated reports whether the request carries a valid admin session cookie.
 func isAuthenticated(r *http.Request) bool {
-	name, secret := adminCreds()
-	if name == "" || secret == "" {
+	name := adminName()
+	key := adminSigningKey()
+	if name == "" || key == "" {
 		return false
 	}
 	c, err := r.Cookie(cookieName)
 	if err != nil {
 		return false
 	}
-	return validateToken(c.Value, name, secret)
+	return validateToken(c.Value, name, key)
 }
 
 // setSessionCookie writes a signed session cookie to the response.
@@ -382,9 +459,10 @@ func loginHandler(section, onSuccess string, tmplFn func(w http.ResponseWriter, 
 			return
 		}
 
-		wantName, wantSecret := adminCreds()
-		if wantName == "" || wantSecret == "" {
-			http.Error(w, "admin credentials not configured (ADMIN_NAME / ADMIN_SECRET)", http.StatusServiceUnavailable)
+		wantName := adminName()
+		sigKey := adminSigningKey()
+		if wantName == "" || sigKey == "" {
+			http.Error(w, "admin credentials not configured (ADMIN_NAME / ADMIN_SECRET / ADMIN_SIGNING_KEY)", http.StatusServiceUnavailable)
 			return
 		}
 		inputName := r.FormValue("username")
@@ -399,9 +477,11 @@ func loginHandler(section, onSuccess string, tmplFn func(w http.ResponseWriter, 
 			return
 		}
 
-		// Constant-time equality check via HMAC to avoid timing side-channels.
-		nameOK := hmac.Equal([]byte(inputName), []byte(wantName))
-		passOK := hmac.Equal([]byte(inputPass), []byte(wantSecret))
+		// Username: constant-time comparison safe for unequal lengths.
+		// Password: verified against the PBKDF2-SHA256 hash computed at startup;
+		// the derivation cost is length-independent so no timing oracle exists.
+		nameOK := constantTimeCompareWithPad([]byte(inputName), []byte(wantName))
+		passOK := verifyPassword(inputPass)
 		if !nameOK || !passOK {
 			recordLoginFailure(ip, inputName)
 			csrf := generateCSRFToken()
@@ -410,7 +490,7 @@ func loginHandler(section, onSuccess string, tmplFn func(w http.ResponseWriter, 
 			return
 		}
 
-		setSessionCookie(w, r, wantName, wantSecret)
+		setSessionCookie(w, r, wantName, sigKey)
 
 		next := cmp.Or(sanitizeRedirect(r.URL.Query().Get(authRedirParam)), onSuccess)
 		http.Redirect(w, r, next, http.StatusFound)

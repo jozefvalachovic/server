@@ -197,14 +197,14 @@ func main() {
 				Method:      swagger.GET,
 				Path:        "/metrics/",
 				Summary:     "Admin metrics UI",
-				Description: "Per-route request counts, latency, and error rates. Protected by ADMIN_NAME / ADMIN_SECRET session cookie.",
+				Description: "Per-route request counts, latency, and error rates. Protected by ADMIN_NAME / ADMIN_SECRET / ADMIN_SIGNING_KEY session cookie.",
 				Tags:        []string{"admin"},
 			},
 			{
 				Method:      swagger.GET,
 				Path:        "/cache/",
 				Summary:     "Admin cache UI",
-				Description: "Cache statistics and live data explorer with delete/flush actions. Protected by ADMIN_NAME / ADMIN_SECRET session cookie.",
+				Description: "Cache statistics and live data explorer with delete/flush actions. Protected by ADMIN_NAME / ADMIN_SECRET / ADMIN_SIGNING_KEY session cookie.",
 				Tags:        []string{"admin"},
 			},
 		},
@@ -276,7 +276,7 @@ func main() {
 			SkipPaths: []string{"/.well-known/appspecific/com.chrome.devtools.json"},
 		},
 
-		// Admin: metrics + cache UI protected by ADMIN_NAME / ADMIN_SECRET.
+		// Admin: metrics + cache UI protected by ADMIN_NAME / ADMIN_SECRET / ADMIN_SIGNING_KEY.
 		// Routes are registered automatically; set both env vars to enable.
 		Admin: adminCfg,
 
@@ -319,8 +319,8 @@ func main() {
 	fmt.Printf("  GET    http://%s:%s/readyz         readiness probe (dep checks)\n", host, port)
 	fmt.Printf("  GET    http://%s:%s/docs           swagger UI\n", host, port)
 	fmt.Printf("  POST   http://%s:%s/mcp            MCP tool server (JSON-RPC 2.0)\n", host, port)
-	fmt.Printf("  GET    http://%s:%s/metrics/       admin metrics UI (ADMIN_NAME + ADMIN_SECRET)\n", host, port)
-	fmt.Printf("  GET    http://%s:%s/cache/         admin cache UI  (ADMIN_NAME + ADMIN_SECRET)\n\n", host, port)
+	fmt.Printf("  GET    http://%s:%s/metrics/       admin metrics UI (ADMIN_NAME + ADMIN_SECRET + ADMIN_SIGNING_KEY)\n", host, port)
+	fmt.Printf("  GET    http://%s:%s/cache/         admin cache UI  (ADMIN_NAME + ADMIN_SECRET + ADMIN_SIGNING_KEY)\n\n", host, port)
 
 	if err := srv.Start(); err != nil {
 		log.Fatalf("server exited: %v", err)

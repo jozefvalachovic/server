@@ -288,7 +288,7 @@ type HTTPServerConfig struct {
 	// When non-nil, NewHTTPServer automatically registers /metrics/, /cache/,
 	// and /admin/* routes and wires the collector middleware.
 	// nil disables all admin instrumentation.
-	// Requires ADMIN_NAME and ADMIN_SECRET environment variables.
+	// Requires ADMIN_NAME, ADMIN_SECRET, and ADMIN_SIGNING_KEY environment variables.
 	Admin *AdminConfig
 
 	// Middlewares are additional application middlewares applied after the

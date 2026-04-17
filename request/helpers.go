@@ -19,8 +19,6 @@ import (
 // spoofed unless they are stripped or validated at a trusted reverse proxy/load
 // balancer. Do not use the returned IP for security-sensitive decisions (e.g.,
 // rate-limiting, banning) unless your infrastructure enforces these headers.
-//
-//go:deprecated Use middleware.IPFilter with TrustedProxies.
 func GetIPAddress(r *http.Request) string {
 	return getIPAddress(r)
 }
