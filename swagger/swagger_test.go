@@ -104,7 +104,7 @@ func TestSchemaFields_BasicStruct(t *testing.T) {
 		ID   int    `json:"id"`
 		Name string `json:"name"`
 	}
-	fields := schemaFields(reflect.TypeOf(Example{}))
+	fields := schemaFields(reflect.TypeFor[Example]())
 	if len(fields) != 2 {
 		t.Fatalf("want 2 fields, got %d", len(fields))
 	}
@@ -121,7 +121,7 @@ func TestSchemaFields_JsonDash_Skipped(t *testing.T) {
 		Public  string `json:"public"`
 		Private string `json:"-"`
 	}
-	fields := schemaFields(reflect.TypeOf(Example{}))
+	fields := schemaFields(reflect.TypeFor[Example]())
 	if len(fields) != 1 {
 		t.Fatalf("want 1 field (json:\"-\" skipped), got %d", len(fields))
 	}
@@ -134,7 +134,7 @@ func TestSchemaFields_Pointer_Unwrapped(t *testing.T) {
 	type Example struct {
 		Val *string `json:"val"`
 	}
-	fields := schemaFields(reflect.TypeOf(Example{}))
+	fields := schemaFields(reflect.TypeFor[Example]())
 	if len(fields) != 1 {
 		t.Fatalf("want 1 field, got %d", len(fields))
 	}
@@ -151,7 +151,7 @@ func TestSchemaFields_Required(t *testing.T) {
 		Req string `json:"req"`
 		Opt string `json:"opt,omitempty"`
 	}
-	fields := schemaFields(reflect.TypeOf(Example{}))
+	fields := schemaFields(reflect.TypeFor[Example]())
 	reqField := fields[0]
 	optField := fields[1]
 	if !reqField.Required {
@@ -170,7 +170,7 @@ func TestSchemaFields_EmbeddedStruct_Inlined(t *testing.T) {
 		Base
 		Name string `json:"name"`
 	}
-	fields := schemaFields(reflect.TypeOf(Item{}))
+	fields := schemaFields(reflect.TypeFor[Item]())
 	if len(fields) != 2 {
 		t.Fatalf("want 2 fields (embedded inlined), got %d", len(fields))
 	}
@@ -191,7 +191,7 @@ func TestSchemaFields_NestedStruct(t *testing.T) {
 		Name    string  `json:"name"`
 		Address Address `json:"address"`
 	}
-	fields := schemaFields(reflect.TypeOf(Person{}))
+	fields := schemaFields(reflect.TypeFor[Person]())
 	if len(fields) != 2 {
 		t.Fatalf("want 2 fields, got %d", len(fields))
 	}
@@ -208,14 +208,14 @@ func TestSchemaFields_PointerToStruct(t *testing.T) {
 	type Example struct {
 		ID int `json:"id"`
 	}
-	fields := schemaFields(reflect.TypeOf((*Example)(nil)))
+	fields := schemaFields(reflect.TypeFor[*Example]())
 	if len(fields) != 1 {
 		t.Fatalf("pointer to struct should resolve, got %d fields", len(fields))
 	}
 }
 
 func TestSchemaFields_NonStruct(t *testing.T) {
-	fields := schemaFields(reflect.TypeOf("string"))
+	fields := schemaFields(reflect.TypeFor[string]())
 	if fields != nil {
 		t.Fatal("non-struct type should return nil")
 	}
@@ -228,16 +228,16 @@ func TestGoTypeName(t *testing.T) {
 		typ  reflect.Type
 		want string
 	}{
-		{reflect.TypeOf(""), "string"},
-		{reflect.TypeOf(true), "boolean"},
-		{reflect.TypeOf(0), "integer"},
-		{reflect.TypeOf(int64(0)), "integer"},
-		{reflect.TypeOf(uint32(0)), "integer"},
-		{reflect.TypeOf(float64(0)), "number"},
-		{reflect.TypeOf(float32(0)), "number"},
-		{reflect.TypeOf(time.Time{}), "string (datetime)"},
-		{reflect.TypeOf([]string{}), "array<string>"},
-		{reflect.TypeOf(map[string]int{}), "object"},
+		{reflect.TypeFor[string](), "string"},
+		{reflect.TypeFor[bool](), "boolean"},
+		{reflect.TypeFor[int](), "integer"},
+		{reflect.TypeFor[int64](), "integer"},
+		{reflect.TypeFor[uint32](), "integer"},
+		{reflect.TypeFor[float64](), "number"},
+		{reflect.TypeFor[float32](), "number"},
+		{reflect.TypeFor[time.Time](), "string (datetime)"},
+		{reflect.TypeFor[[]string](), "array<string>"},
+		{reflect.TypeFor[map[string]int](), "object"},
 	}
 	for _, tc := range tests {
 		got := goTypeName(tc.typ)
@@ -248,7 +248,7 @@ func TestGoTypeName(t *testing.T) {
 }
 
 func TestGoTypeName_PointerUnwrap(t *testing.T) {
-	got := goTypeName(reflect.TypeOf((*time.Time)(nil)))
+	got := goTypeName(reflect.TypeFor[*time.Time]())
 	if got != "string (datetime)" {
 		t.Fatalf("pointer to time.Time should be 'string (datetime)', got %q", got)
 	}
