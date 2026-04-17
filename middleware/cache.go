@@ -3,6 +3,7 @@ package middleware
 import (
 	"bytes"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -180,9 +181,26 @@ func HTTPCache(cfg HTTPCacheConfig) func(http.Handler) http.Handler {
 		invalidateSet[m] = struct{}{}
 	}
 
+	// Fail-fast probe: call KeyPrefix with a minimal synthetic request to catch
+	// obviously broken configurations at server startup instead of at the first
+	// real request. We only flag a ':' in the output when the probe returns a
+	// non-empty string; a KeyPrefix that relies on request-specific fields
+	// (headers, host, auth) may legitimately return "" here, and the runtime
+	// guard below will still catch per-request breakage.
+	if cfg.Store != nil && cfg.KeyPrefix != nil {
+		probe := &http.Request{Method: http.MethodGet, URL: &url.URL{Path: "/"}, Header: http.Header{}}
+		if pp := cfg.KeyPrefix(probe); pp != "" && strings.ContainsRune(pp, ':') {
+			panic("middleware.HTTPCache: KeyPrefix returned a value containing ':' for a probe request; ':' is reserved as the prefix/key separator and must not appear in KeyPrefix output")
+		}
+	}
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Guard: middleware not fully configured.
+			// Guard: middleware not fully configured. KeyPrefix is probed at
+			// construction time (see HTTPCache's init-time panic on a panicking
+			// probe), so a nil KeyPrefix here indicates Store was nil-ed out
+			// post-construction or the middleware was constructed via struct
+			// literal without calling the factory.
 			if cfg.Store == nil || cfg.KeyPrefix == nil {
 				next.ServeHTTP(w, r)
 				return

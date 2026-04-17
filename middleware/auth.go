@@ -116,15 +116,15 @@ func Auth(cfg AuthConfig) func(http.Handler) http.Handler {
 	if cfg.Realm == "" {
 		cfg.Realm = "API"
 	}
-	skipExact := make(map[string]bool, len(cfg.SkipPaths))
-	var skipPrefixes []string
-	for _, p := range cfg.SkipPaths {
-		if len(p) > 0 && p[len(p)-1] == '/' {
-			skipPrefixes = append(skipPrefixes, p)
-		} else {
-			skipExact[p] = true
-		}
+	// Reject realm values containing bytes that would terminate the
+	// WWW-Authenticate quoted-string or inject new headers. RFC 7235 defines
+	// the challenge as a quoted-string and the stdlib writes the header
+	// verbatim; a caller who forwards user input into Realm without this
+	// guard would enable header injection / response splitting.
+	if strings.ContainsAny(cfg.Realm, "\r\n\"") {
+		panic("middleware.Auth: Realm must not contain CR, LF, or double-quote characters")
 	}
+	skip := newPathSkipper(cfg.SkipPaths)
 
 	wwwAuth := string(cfg.Scheme) + ` realm="` + cfg.Realm + `"`
 
@@ -132,16 +132,9 @@ func Auth(cfg AuthConfig) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// SkipPaths supports both exact-match and prefix-match (trailing '/').
 			// "/health" matches only "/health"; "/admin/" matches "/admin/metrics".
-			path := r.URL.Path
-			if skipExact[path] {
+			if skip.skip(r.URL.Path) {
 				next.ServeHTTP(w, r)
 				return
-			}
-			for _, sp := range skipPrefixes {
-				if strings.HasPrefix(path, sp) {
-					next.ServeHTTP(w, r)
-					return
-				}
 			}
 
 			credential, ok := extractCredential(r, cfg.Scheme, cfg.APIKeyHeader)

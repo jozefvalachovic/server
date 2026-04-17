@@ -95,6 +95,14 @@ func (cb *circuitBreaker) allow() bool {
 		if time.Since(cb.openedAt) >= cb.cfg.OpenDuration {
 			cb.state = cbHalfOpen
 			cb.successes = 0
+			// Reserve the half-open probe slot atomically with the state
+			// transition itself. Without this pre-reservation, concurrent
+			// allow() callers could all observe cbHalfOpen before any has
+			// called inFlight.Add(1), and every one of them would see
+			// Add(1) == 1 thanks to ordering relative to recordSuccess /
+			// recordFailure decrements — a small thundering-herd window
+			// that defeats the "one probe at a time" contract.
+			cb.inFlight.Store(1)
 			return true
 		}
 		return false
@@ -289,7 +297,9 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	// strings.Reader, and bytes.Reader; other readers must set it explicitly).
 	// Without GetBody the body is exhausted after the first attempt and retries
 	// would silently send an empty payload.
-	canRetryBody := req.Body == nil || req.GetBody != nil
+	// Note: http.NoBody is the canonical empty-body sentinel and is always safe
+	// to replay even though net/http does not attach a GetBody for it.
+	canRetryBody := req.Body == nil || req.Body == http.NoBody || req.GetBody != nil
 
 	var (
 		resp    *http.Response
@@ -368,7 +378,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 // Get is a convenience wrapper around Do for GET requests.
 // The url parameter can be absolute or relative to BaseURL.
 func (c *Client) Get(ctx context.Context, url string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {
 		return nil, err
 	}
@@ -411,7 +421,7 @@ func (c *Client) Patch(ctx context.Context, url, contentType string, body io.Rea
 // Delete is a convenience wrapper around Do for DELETE requests.
 // The url parameter can be absolute or relative to BaseURL.
 func (c *Client) Delete(ctx context.Context, url string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, http.NoBody)
 	if err != nil {
 		return nil, err
 	}

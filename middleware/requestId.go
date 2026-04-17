@@ -2,8 +2,6 @@ package middleware
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"net/http"
 
 	"github.com/jozefvalachovic/logger/v4"
@@ -103,9 +101,7 @@ func contextWithRequestID(ctx context.Context, id string) context.Context {
 }
 
 func defaultIDGenerator() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+	return randomHex(16)
 }
 
 // sanitizeRequestID caps the length and removes control characters from

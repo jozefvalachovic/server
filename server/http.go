@@ -1,6 +1,7 @@
 package server
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -208,6 +209,14 @@ type HTTPServerConfig struct {
 	// Set explicitly to override. See NoReadTimeout to disable entirely.
 	ReadTimeout time.Duration
 
+	// ReadHeaderTimeout is the maximum duration for reading the request
+	// headers. It is the primary defense against slow-header DoS attacks
+	// (Slowloris). Default: config.HTTPReadHeaderTimeout. If ReadTimeout is
+	// set but ReadHeaderTimeout is not, the default is still applied so that
+	// the header-read phase remains bounded. Set NoReadHeaderTimeout to
+	// disable entirely (not recommended in production).
+	ReadHeaderTimeout time.Duration
+
 	// WriteTimeout is the maximum duration before timing out writes of the
 	// response. Default: config.DefaultWriteTimeout (60 s).
 	// Set explicitly to override. See NoWriteTimeout to disable entirely.
@@ -217,6 +226,12 @@ type HTTPServerConfig struct {
 	// to 0). Use when an explicit zero/infinite timeout is intended and the default
 	// should not be applied. Has no effect when ReadTimeout is set to a positive value.
 	NoReadTimeout bool
+
+	// NoReadHeaderTimeout disables the header-read timeout entirely. Same
+	// semantics as NoReadTimeout but for http.Server.ReadHeaderTimeout.
+	// Strongly discouraged outside of tests — leaves the server open to
+	// Slowloris-style attacks.
+	NoReadHeaderTimeout bool
 
 	// NoWriteTimeout disables the write timeout entirely. Same semantics as
 	// NoReadTimeout but for http.Server.WriteTimeout.
@@ -313,6 +328,13 @@ type AdminConfig struct {
 	// Store is the application cache store used by the /cache/ section.
 	// nil disables cache-related features.
 	Store *cache.CacheStore
+	// TrustXForwardedProto, when true, allows the admin layer to treat an
+	// incoming X-Forwarded-Proto: https header as evidence that the request
+	// was HTTPS and therefore set the Secure flag on session/CSRF cookies.
+	// Default false. Enable only behind a trusted reverse proxy that strips
+	// or overrides this header from client input, otherwise a plain-HTTP
+	// attacker could set it freely (no privilege gain — but surprising).
+	TrustXForwardedProto bool
 }
 
 type HTTPServer struct {
@@ -444,10 +466,11 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 	if cfg.Admin != nil {
 		adminCollector = admin.NewCollector()
 		admin.Register(mux, admin.Config{
-			AppName:    cfg.Admin.AppName,
-			AppVersion: cfg.Admin.AppVersion,
-			Collector:  adminCollector,
-			Store:      cfg.Admin.Store,
+			AppName:              cfg.Admin.AppName,
+			AppVersion:           cfg.Admin.AppVersion,
+			Collector:            adminCollector,
+			Store:                cfg.Admin.Store,
+			TrustXForwardedProto: cfg.Admin.TrustXForwardedProto,
 		})
 	}
 
@@ -549,21 +572,24 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 	if !cfg.NoWriteTimeout && writeTimeout == 0 {
 		writeTimeout = config.DefaultWriteTimeout
 	}
+	// ReadHeaderTimeout is applied independently of ReadTimeout so that even
+	// callers who intentionally disable ReadTimeout (e.g. long upload APIs)
+	// still get Slowloris protection unless they explicitly opt out via
+	// NoReadHeaderTimeout.
+	readHeaderTimeout := cfg.ReadHeaderTimeout
+	if !cfg.NoReadHeaderTimeout && readHeaderTimeout == 0 {
+		readHeaderTimeout = config.HTTPReadHeaderTimeout
+	}
 
 	srv := &http.Server{
 		Addr:              host + ":" + port,
 		TLSConfig:         cfg.TLSConfig,
 		Handler:           handler,
 		IdleTimeout:       config.HTTPIdleTimeout,
-		ReadHeaderTimeout: config.HTTPReadHeaderTimeout,
-		MaxHeaderBytes: func() int {
-			if cfg.MaxHeaderBytes > 0 {
-				return cfg.MaxHeaderBytes
-			}
-			return 1 << 20 // 1 MiB default
-		}(),
-		ReadTimeout:  readTimeout,
-		WriteTimeout: writeTimeout,
+		ReadHeaderTimeout: readHeaderTimeout,
+		MaxHeaderBytes:    cmp.Or(cfg.MaxHeaderBytes, 1<<20), // 1 MiB default
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
 	}
 
 	// Wire optional BaseContext / ConnContext hooks so callers can inject
@@ -616,6 +642,16 @@ func (as *HTTPServer) Start() error {
 	as.listener = ln
 
 	go func(ln net.Listener) {
+		// Always close the listener when the serve goroutine exits. http.Server.Shutdown
+		// closes it itself on graceful shutdown (returning net.ErrClosed here, which we
+		// tolerate), but if Serve exits for any other reason the listener would leak
+		// without this defer. See https://pkg.go.dev/net/http#Server.Serve — callers are
+		// responsible for closing the listener.
+		defer func() {
+			if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				as.log.LogWarn("Listener close error", "error", err.Error())
+			}
+		}()
 		as.log.LogInfo("Server starting", "port", as.port)
 		var serveErr error
 		if as.tlsConfig != nil {
@@ -651,6 +687,10 @@ func (as *HTTPServer) StartWithContext(ctx context.Context) error {
 // GracefulShutdown performs graceful shutdown of the HTTP server.
 // The caller controls the deadline via ctx (typically context.WithTimeout).
 // Returns the first non-nil error encountered during shutdown.
+//
+// Safe to call multiple times and safe to follow with ForceShutdown if the
+// graceful deadline is exceeded — http.Server.Shutdown and http.Server.Close
+// are both idempotent in the stdlib.
 func (as *HTTPServer) GracefulShutdown(ctx context.Context) error {
 	if as == nil {
 		return nil
@@ -689,12 +729,15 @@ func (as *HTTPServer) GracefulShutdown(ctx context.Context) error {
 	return shutdownErr
 }
 
-// ForceShutdown immediately stops the server without waiting for ongoing requests
+// ForceShutdown immediately stops the server without waiting for ongoing requests.
+// Safe to call multiple times (http.Server.Close is idempotent), and safe to
+// call after GracefulShutdown as an escalation when the graceful deadline is
+// exceeded.
 func (as *HTTPServer) ForceShutdown() {
 	if as == nil {
 		return
 	}
-	if err := as.server.Close(); err != nil {
+	if err := as.server.Close(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		as.log.LogError("Server forced to close", "error", err.Error())
 	}
 

@@ -53,16 +53,23 @@ func SanitizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
 }
 
+// ErrEmailRequired is returned by ValidateEmail when the input is empty.
+var ErrEmailRequired = errors.New("email is required")
+
+// ErrEmailInvalid is returned by ValidateEmail when the input does not parse
+// as a valid RFC 5322 address.
+var ErrEmailInvalid = errors.New("invalid email format")
+
 // ValidateEmail checks if the email is in a valid format
 func ValidateEmail(email string) error {
 	email = strings.TrimSpace(email)
 	if email == "" {
-		return errors.New("email is required")
+		return ErrEmailRequired
 	}
 
 	_, err := mail.ParseAddress(email)
 	if err != nil {
-		return errors.New("invalid email format")
+		return ErrEmailInvalid
 	}
 
 	return nil

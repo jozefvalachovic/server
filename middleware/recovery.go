@@ -3,9 +3,9 @@ package middleware
 import (
 	"bufio"
 	"errors"
-	"fmt"
 	"net"
 	"net/http"
+	"os"
 
 	"github.com/jozefvalachovic/server/response"
 
@@ -52,26 +52,37 @@ func (rw *responseWriterTracker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if h, ok := rw.ResponseWriter.(http.Hijacker); ok {
 		return h.Hijack()
 	}
-	return nil, nil, errors.New("responseWriterTracker: underlying ResponseWriter does not implement http.Hijacker")
+	return nil, nil, errors.New("hijack not supported")
 }
 
-// Recovery recovers from panics and returns proper error responses
+// Recovery recovers from panics and returns proper error responses.
+//
+// Stack-trace logging is gated on the ENV environment variable: when ENV is
+// unset or not "production", full stack traces are logged for developer
+// diagnosis. In production (ENV=production), only the panic value, method,
+// path, and remote address are logged to avoid leaking internal code
+// structure through log sinks that are accessible to attackers.
 func Recovery(next http.Handler) http.Handler {
+	production := os.Getenv("ENV") == "production"
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rw := &responseWriterTracker{ResponseWriter: w}
 		defer func() {
 			if rec := recover(); rec != nil {
-				var panicErr error
-				if e, ok := rec.(error); ok {
-					panicErr = e
+				panicErr := panicToError(rec)
+				if production {
+					logger.LogError("Panic recovered",
+						"error", panicErr.Error(),
+						"method", r.Method,
+						"path", r.URL.Path,
+						"remote", r.RemoteAddr,
+					)
 				} else {
-					panicErr = fmt.Errorf("%v", rec)
+					logger.LogErrorWithStack(panicErr, "Panic recovered",
+						"method", r.Method,
+						"path", r.URL.Path,
+						"remote", r.RemoteAddr,
+					)
 				}
-				logger.LogErrorWithStack(panicErr, "Panic recovered",
-					"method", r.Method,
-					"path", r.URL.Path,
-					"remoteAddr", r.RemoteAddr,
-				)
 
 				// Only write an error response if headers have not been committed yet.
 				// Once WriteHeader/Write has been called the status line is on the wire

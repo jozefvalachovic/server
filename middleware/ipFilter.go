@@ -172,12 +172,18 @@ func IPFilter(cfgs ...IPFilterConfig) func(http.Handler) http.Handler {
 func clientIP(r *http.Request, trustForwarded bool, proxyNets []*net.IPNet) string {
 	if trustForwarded && len(proxyNets) > 0 {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			// Split the XFF list; each element is an IP added by a proxy hop.
-			// Walk from right to left, skipping hops that are trusted proxies.
-			// The first non-trusted entry is the real client IP.
-			parts := strings.Split(xff, ",")
-			for i := len(parts) - 1; i >= 0; i-- {
-				candidate := strings.TrimSpace(parts[i])
+			// Walk the XFF list from right to left, skipping entries that are
+			// trusted proxies. The first non-trusted entry is the real client IP.
+			//
+			// Iterate in place with strings.LastIndexByte rather than allocating
+			// a full []string via strings.Split. Under XFF-heavy load (DDoS via
+			// header spam, for example) this removes a per-request allocation
+			// and cuts GC pressure on the hottest path in the filter.
+			end := len(xff)
+			for end > 0 {
+				start := strings.LastIndexByte(xff[:end], ',') + 1
+				candidate := strings.TrimSpace(xff[start:end])
+				end = start - 1 // skip the comma for the next iteration
 				if candidate == "" {
 					continue
 				}

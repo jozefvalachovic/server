@@ -129,11 +129,19 @@ type certReloaderConfig struct {
 }
 
 // WithPollInterval overrides the default 30-second file poll interval.
+// Values below 1 second are clamped up to 1 second to avoid a hot filesystem
+// stat loop that wastes CPU on every reloader goroutine and drowns legitimate
+// change events in polling noise.
 func WithPollInterval(d time.Duration) CertReloaderOption {
 	return func(c *certReloaderConfig) {
-		if d > 0 {
-			c.pollInterval = d
+		if d <= 0 {
+			return
 		}
+		const minPoll = 1 * time.Second
+		if d < minPoll {
+			d = minPoll
+		}
+		c.pollInterval = d
 	}
 }
 

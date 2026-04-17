@@ -38,8 +38,12 @@ func (c *HTTPServerConfig) Validate() error {
 			errs = append(errs, fmt.Errorf("RateLimitConfig.Burst must be > 0, got %d", c.RateLimitConfig.Burst))
 		}
 	}
-	if c.TLSConfig != nil && c.TLSConfig.MinVersion != 0 && c.TLSConfig.MinVersion < 0x0303 {
-		errs = append(errs, errors.New("TLSConfig.MinVersion is below TLS 1.2 — not recommended"))
+	if c.TLSConfig != nil {
+		if c.TLSConfig.MinVersion == 0 {
+			errs = append(errs, errors.New("TLSConfig.MinVersion must be set explicitly — stdlib default drops to TLS 1.0; set at least tls.VersionTLS12"))
+		} else if c.TLSConfig.MinVersion < 0x0303 {
+			errs = append(errs, errors.New("TLSConfig.MinVersion is below TLS 1.2 — not recommended"))
+		}
 	}
 
 	return errors.Join(errs...)
@@ -58,8 +62,12 @@ func (c *TCPServerConfig) Validate() error {
 	if c.RateLimitConfig != nil && c.RateLimitConfig.ConnectionsPerSecond <= 0 {
 		errs = append(errs, fmt.Errorf("RateLimitConfig.ConnectionsPerSecond must be > 0, got %f", c.RateLimitConfig.ConnectionsPerSecond))
 	}
-	if c.TLSConfig != nil && c.TLSConfig.MinVersion != 0 && c.TLSConfig.MinVersion < 0x0303 {
-		errs = append(errs, errors.New("TLSConfig.MinVersion is below TLS 1.2 — not recommended"))
+	if c.TLSConfig != nil {
+		if c.TLSConfig.MinVersion == 0 {
+			errs = append(errs, errors.New("TLSConfig.MinVersion must be set explicitly — stdlib default drops to TLS 1.0; set at least tls.VersionTLS12"))
+		} else if c.TLSConfig.MinVersion < 0x0303 {
+			errs = append(errs, errors.New("TLSConfig.MinVersion is below TLS 1.2 — not recommended"))
+		}
 	}
 
 	return errors.Join(errs...)

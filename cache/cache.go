@@ -651,13 +651,21 @@ func estimateBytes(key string, v any) int64 {
 	}
 }
 
-// Error definitions
+// Sentinel errors returned by the cache API.
 var (
-	ErrInvalidKey             = errors.New("invalid key: cannot be empty")
-	ErrInvalidTTL             = errors.New("invalid TTL: must be greater than zero")
+	// ErrInvalidKey is returned when a Set/Get/Delete call receives an empty key.
+	ErrInvalidKey = errors.New("invalid key: cannot be empty")
+	// ErrInvalidTTL is returned by Validate when TTL is non-positive.
+	ErrInvalidTTL = errors.New("invalid TTL: must be greater than zero")
+	// ErrInvalidCleanupInterval is returned by Validate when CleanupInterval is non-positive.
 	ErrInvalidCleanupInterval = errors.New("invalid CleanupInterval: must be greater than zero")
-	ErrInvalidMaxSize         = errors.New("invalid MaxSize: must be greater than zero")
-	ErrInvalidMaxMemory       = errors.New("invalid MaxMemoryMB: must be greater than zero")
-	ErrEntryTooLarge          = errors.New("entry exceeds MaxMemoryMB limit and was evicted immediately")
-	ErrNotFound               = errors.New("key not found in cache")
+	// ErrInvalidMaxSize is returned by Validate when MaxSize is non-positive.
+	ErrInvalidMaxSize = errors.New("invalid MaxSize: must be greater than zero")
+	// ErrInvalidMaxMemory is returned by Validate when MaxMemoryMB is non-positive.
+	ErrInvalidMaxMemory = errors.New("invalid MaxMemoryMB: must be greater than zero")
+	// ErrEntryTooLarge is returned by Set when the single entry exceeds the
+	// configured MaxMemoryMB budget and is therefore evicted immediately.
+	ErrEntryTooLarge = errors.New("entry exceeds MaxMemoryMB limit and was evicted immediately")
+	// ErrNotFound is returned by Get when the key is absent or has expired.
+	ErrNotFound = errors.New("key not found in cache")
 )

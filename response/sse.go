@@ -2,6 +2,7 @@ package response
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync/atomic"
@@ -9,6 +10,11 @@ import (
 
 	"github.com/jozefvalachovic/logger/v4"
 )
+
+// ErrWriterClosed is returned by SSEWriter methods once the stream has been
+// closed — either explicitly, by request-context cancellation, or by a
+// previous write failure.
+var ErrWriterClosed = errors.New("sse: writer closed")
 
 // SSEWriter writes Server-Sent Events framed as JSON APIStream envelopes.
 // It handles flushing, heartbeats, and respects the request context.
@@ -47,7 +53,7 @@ func NewSSEWriter[T any](w http.ResponseWriter, r *http.Request) *SSEWriter[T] {
 // Returns an error if the client has disconnected or writing fails.
 func (s *SSEWriter[T]) Send(data T) error {
 	if s.closed.Load() {
-		return fmt.Errorf("sse: writer closed")
+		return ErrWriterClosed
 	}
 
 	select {
@@ -79,7 +85,7 @@ func (s *SSEWriter[T]) Send(data T) error {
 // SendError writes an error event and marks the stream as closed.
 func (s *SSEWriter[T]) SendError(message string, details string) error {
 	if s.closed.Load() {
-		return fmt.Errorf("sse: writer closed")
+		return ErrWriterClosed
 	}
 	s.closed.Store(true)
 
@@ -107,7 +113,7 @@ func (s *SSEWriter[T]) SendError(message string, details string) error {
 // SendHeartbeat writes a heartbeat comment event to keep the connection alive.
 func (s *SSEWriter[T]) SendHeartbeat() error {
 	if s.closed.Load() {
-		return fmt.Errorf("sse: writer closed")
+		return ErrWriterClosed
 	}
 
 	select {

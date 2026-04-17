@@ -35,6 +35,7 @@
 package swagger
 
 import (
+	"cmp"
 	"embed"
 	"html/template"
 	"net/http"
@@ -237,9 +238,7 @@ func schemaFields(t reflect.Type) []Field {
 		}
 
 		jsonName, rest, _ := strings.Cut(tag, ",")
-		if jsonName == "" {
-			jsonName = sf.Name
-		}
+		jsonName = cmp.Or(jsonName, sf.Name)
 		omitempty := strings.Contains(rest, "omitempty")
 
 		ft := sf.Type

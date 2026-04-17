@@ -2,9 +2,7 @@ package middleware
 
 import (
 	"context"
-	"fmt"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -55,6 +53,22 @@ type TimeoutConfig struct {
 // will terminate cleanly. If the handler writes any bytes before the deadline
 // fires, no 504 is injected (the response is already committed).
 //
+// # Handler goroutine lifetime
+//
+// IMPORTANT: cancelling the request context does NOT forcibly stop the handler
+// goroutine. Go has no safe goroutine preemption primitive, so a handler that
+// ignores r.Context().Done() (for example, one making a blocking syscall or a
+// synchronous DB driver call without a context-aware API) will continue running
+// until it returns of its own accord, even though the client has already
+// received a 504. This is leaked CPU/memory that the middleware cannot reclaim.
+//
+// To bound handler lifetime in practice:
+//   - Pass r.Context() through every downstream call (http.Client, sql.DB,
+//     exec.Cmd, custom workers) so cancellation propagates.
+//   - Wrap blocking I/O with context.AfterFunc or a select on ctx.Done().
+//   - For handlers that intentionally exceed the deadline, add them to
+//     SkipPaths rather than relying on Timeout to mask long-running work.
+//
 // # Streaming / SSE handlers
 //
 // Handlers that intentionally outlive the default timeout (SSE, long-poll,
@@ -96,29 +110,14 @@ func Timeout(cfgs ...TimeoutConfig) func(http.Handler) http.Handler {
 	errMsg := cfg.ErrorMessage
 
 	// Pre-compute skip sets for O(1) exact match and prefix scanning.
-	skipExact := make(map[string]bool, len(cfg.SkipPaths))
-	var skipPrefixes []string
-	for _, p := range cfg.SkipPaths {
-		if len(p) > 0 && p[len(p)-1] == '/' {
-			skipPrefixes = append(skipPrefixes, p)
-		} else {
-			skipExact[p] = true
-		}
-	}
+	skip := newPathSkipper(cfg.SkipPaths)
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// SkipPaths bypass — no timeout applied.
-			path := r.URL.Path
-			if skipExact[path] {
+			if skip.skip(r.URL.Path) {
 				next.ServeHTTP(w, r)
 				return
-			}
-			for _, sp := range skipPrefixes {
-				if strings.HasPrefix(path, sp) {
-					next.ServeHTTP(w, r)
-					return
-				}
 			}
 
 			ctx, cancel := context.WithTimeout(r.Context(), timeout)
@@ -136,12 +135,7 @@ func Timeout(cfgs ...TimeoutConfig) func(http.Handler) http.Handler {
 				// not committed" pattern from the Recovery middleware.
 				defer func() {
 					if rec := recover(); rec != nil {
-						var panicErr error
-						if e, ok := rec.(error); ok {
-							panicErr = e
-						} else {
-							panicErr = fmt.Errorf("%v", rec)
-						}
+						panicErr := panicToError(rec)
 						logger.LogErrorWithStack(panicErr, "Panic recovered inside Timeout handler goroutine",
 							"path", r.URL.Path,
 						)

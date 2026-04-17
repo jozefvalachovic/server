@@ -82,10 +82,16 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 		next.ServeHTTP(cw, r)
 		ms := time.Since(start).Milliseconds()
 
-		// Use the matched pattern when available (Go 1.22+), else the path.
+		// Use the matched pattern when available (Go 1.22+). Falling back to
+		// r.URL.Path would turn unmatched requests into an unbounded-cardinality
+		// attack vector: any URL the server returns 404 for would allocate a
+		// new routeStats entry, letting an attacker exhaust memory by hitting
+		// random paths. Bucket all unmatched requests under a single sentinel
+		// pattern so the map size stays bounded by the number of registered
+		// routes plus one.
 		pattern := r.Pattern
 		if pattern == "" {
-			pattern = r.URL.Path
+			pattern = "<unmatched>"
 		}
 
 		s := c.stats(pattern)

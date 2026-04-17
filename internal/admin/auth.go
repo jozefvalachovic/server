@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"cmp"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -23,6 +24,28 @@ const (
 	sessionTTL     = 8 * time.Hour
 	authRedirParam = "next"
 )
+
+// trustXFP is set by Register() during admin bootstrap to indicate whether
+// X-Forwarded-Proto from the incoming request should be consulted when
+// deciding if the session/CSRF cookies must be marked Secure. Default false
+// (safe fallback: only r.TLS is trusted).
+var trustXFP bool
+
+// isSecureRequest reports whether the cookie Secure flag should be set.
+// When trustXFP is true the X-Forwarded-Proto header is honoured, intended
+// for deployments behind a TLS-terminating reverse proxy that strips /
+// overrides the header from upstream clients. Do not enable trustXFP when
+// untrusted traffic can reach the admin layer directly — the header is
+// otherwise client-supplied.
+func isSecureRequest(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if trustXFP && r.Header.Get("X-Forwarded-Proto") == "https" {
+		return true
+	}
+	return false
+}
 
 // adminCreds returns the configured ADMIN_NAME and ADMIN_SECRET from env.
 func adminCreds() (name, secret string) {
@@ -95,7 +118,7 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, name, secret strin
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
+		Secure:   isSecureRequest(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(sessionTTL.Seconds()),
 	})
@@ -111,7 +134,7 @@ func clearSessionCookie(w http.ResponseWriter, r *http.Request) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
+		Secure:   isSecureRequest(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
@@ -130,12 +153,13 @@ func requireAdmin(next http.Handler, authRedirectURL string) http.Handler {
 
 // ── CSRF double-submit cookie ────────────────────────────────────────────────
 
-// generateCSRFToken returns a 32-byte random hex string for the double-submit
-// cookie CSRF pattern.
+// generateCSRFToken returns a cryptographically random, URL-safe token for
+// the double-submit cookie CSRF pattern. Uses crypto/rand.Text (Go 1.24+)
+// which returns 26 base32 characters = ~130 bits of entropy — more than
+// sufficient for a short-lived anti-CSRF token and one call shorter than
+// the prior make+Read+Encode triplet.
 func generateCSRFToken() string {
-	b := make([]byte, 32)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+	return rand.Text()
 }
 
 // setCSRFCookie writes a short-lived CSRF cookie for the login form.
@@ -145,7 +169,7 @@ func setCSRFCookie(w http.ResponseWriter, r *http.Request, token string) {
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
+		Secure:   isSecureRequest(r),
 		SameSite: http.SameSiteStrictMode,
 		MaxAge:   900, // 15 minutes
 	})
@@ -181,14 +205,29 @@ const (
 )
 
 var loginLimiter struct {
-	mu       sync.Mutex
+	mu sync.Mutex
+	// attempts tracks failed login timestamps keyed by source IP. IP-based
+	// tracking stops a single attacker probing from one source.
 	attempts map[string][]time.Time
-	stopOnce sync.Once
-	stopCh   chan struct{}
+	// userAttempts tracks failed login timestamps keyed by the submitted
+	// username. Username-based tracking defeats distributed credential
+	// stuffing where an attacker rotates source IPs but targets a fixed
+	// known admin username — without this, the IP limiter rate-limits nothing
+	// because each IP only attempts once. Counted per submitted username so
+	// the attacker cannot enumerate valid usernames (every name is tracked).
+	userAttempts map[string][]time.Time
+	stopOnce     sync.Once
+	stopCh       chan struct{}
 }
+
+// loginMaxUserAttempts caps failed attempts per submitted username across
+// ALL source IPs inside loginWindow. Higher than the per-IP cap because
+// legitimate users occasionally mistype from shared egress (offices, VPNs).
+const loginMaxUserAttempts = 20
 
 func init() {
 	loginLimiter.attempts = make(map[string][]time.Time)
+	loginLimiter.userAttempts = make(map[string][]time.Time)
 	loginLimiter.stopCh = make(chan struct{})
 
 	// Background janitor evicts stale IPs every loginWindow so that rotated
@@ -206,24 +245,31 @@ func init() {
 				now := time.Now()
 				cutoff := now.Add(-loginWindow)
 				loginLimiter.mu.Lock()
-				for ip, times := range loginLimiter.attempts {
-					n := 0
-					for _, t := range times {
-						if t.After(cutoff) {
-							times[n] = t
-							n++
-						}
-					}
-					if n == 0 {
-						delete(loginLimiter.attempts, ip)
-					} else {
-						loginLimiter.attempts[ip] = times[:n]
-					}
-				}
+				pruneLocked(loginLimiter.attempts, cutoff)
+				pruneLocked(loginLimiter.userAttempts, cutoff)
 				loginLimiter.mu.Unlock()
 			}
 		}
 	}()
+}
+
+// pruneLocked drops entries older than cutoff and removes empty slots.
+// Caller must hold loginLimiter.mu.
+func pruneLocked(m map[string][]time.Time, cutoff time.Time) {
+	for k, times := range m {
+		n := 0
+		for _, t := range times {
+			if t.After(cutoff) {
+				times[n] = t
+				n++
+			}
+		}
+		if n == 0 {
+			delete(m, k)
+		} else {
+			m[k] = times[:n]
+		}
+	}
 }
 
 // StopLoginLimiter terminates the background login-rate-limit janitor.
@@ -255,9 +301,41 @@ func loginRateOK(ip string) bool {
 	return n < loginMaxAttempts
 }
 
-func recordLoginFailure(ip string) {
+// loginUserRateOK returns true if the submitted username has not exceeded
+// its cross-IP attempt cap inside the rolling window. Empty usernames always
+// pass (they fail credential check anyway and do not indicate targeted
+// enumeration). The check and eviction happen atomically under the same
+// mutex used by the IP limiter so both views stay consistent.
+func loginUserRateOK(username string) bool {
+	if username == "" {
+		return true
+	}
 	loginLimiter.mu.Lock()
-	loginLimiter.attempts[ip] = append(loginLimiter.attempts[ip], time.Now())
+	defer loginLimiter.mu.Unlock()
+	cutoff := time.Now().Add(-loginWindow)
+	recent := loginLimiter.userAttempts[username]
+	n := 0
+	for _, t := range recent {
+		if t.After(cutoff) {
+			recent[n] = t
+			n++
+		}
+	}
+	if n == 0 {
+		delete(loginLimiter.userAttempts, username)
+		return true
+	}
+	loginLimiter.userAttempts[username] = recent[:n]
+	return n < loginMaxUserAttempts
+}
+
+func recordLoginFailure(ip, username string) {
+	loginLimiter.mu.Lock()
+	now := time.Now()
+	loginLimiter.attempts[ip] = append(loginLimiter.attempts[ip], now)
+	if username != "" {
+		loginLimiter.userAttempts[username] = append(loginLimiter.userAttempts[username], now)
+	}
 	loginLimiter.mu.Unlock()
 }
 
@@ -312,11 +390,20 @@ func loginHandler(section, onSuccess string, tmplFn func(w http.ResponseWriter, 
 		inputName := r.FormValue("username")
 		inputPass := r.FormValue("password")
 
+		// Per-username rate check runs after form parsing so we have the
+		// submitted username, but before credential validation so an attacker
+		// cannot rotate IPs to bypass the per-IP cap. Uses the same generic
+		// "too many attempts" error to avoid exposing which axis tripped.
+		if !loginUserRateOK(inputName) {
+			http.Error(w, "Too many login attempts. Try again later.", http.StatusTooManyRequests)
+			return
+		}
+
 		// Constant-time equality check via HMAC to avoid timing side-channels.
 		nameOK := hmac.Equal([]byte(inputName), []byte(wantName))
 		passOK := hmac.Equal([]byte(inputPass), []byte(wantSecret))
 		if !nameOK || !passOK {
-			recordLoginFailure(ip)
+			recordLoginFailure(ip, inputName)
 			csrf := generateCSRFToken()
 			setCSRFCookie(w, r, csrf)
 			tmplFn(w, "Invalid username or password.", csrf, sanitizeRedirect(r.URL.Query().Get(authRedirParam)))
@@ -325,10 +412,7 @@ func loginHandler(section, onSuccess string, tmplFn func(w http.ResponseWriter, 
 
 		setSessionCookie(w, r, wantName, wantSecret)
 
-		next := sanitizeRedirect(r.URL.Query().Get(authRedirParam))
-		if next == "" {
-			next = onSuccess
-		}
+		next := cmp.Or(sanitizeRedirect(r.URL.Query().Get(authRedirParam)), onSuccess)
 		http.Redirect(w, r, next, http.StatusFound)
 	}
 	_ = section // reserved for structured logging

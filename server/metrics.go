@@ -1,10 +1,12 @@
 package server
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -39,12 +41,33 @@ func StartMetricsServer(cfg *MetricsServerConfig) (*MetricsServer, error) {
 	if portErr != nil || portNum < 1 || portNum > 65535 {
 		return nil, fmt.Errorf("METRICS_PORT %q is not a valid port number (1–65535)", port)
 	}
-	host := os.Getenv("METRICS_HOST")
-	if host == "" {
-		host = "127.0.0.1" // default to loopback; set METRICS_HOST=0.0.0.0 to expose externally
+	host := cmp.Or(os.Getenv("METRICS_HOST"), "127.0.0.1") // default loopback; set METRICS_HOST=0.0.0.0 to expose externally
+	// Warn when the metrics endpoint is bound to a non-loopback address.
+	// Metrics can leak request rates, cardinality information, and internal
+	// error codes, so exposing them publicly is a configuration smell even
+	// when the caller does so deliberately. The warning is informational
+	// only — callers who need external exposure should gate access via the
+	// network layer (mTLS, firewall, service mesh).
+	if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() {
+		logger.LogWarn("Metrics server binding to non-loopback address; ensure access is restricted at the network layer",
+			"host", host,
+		)
+	} else if ip == nil && host != "localhost" {
+		logger.LogWarn("Metrics server bound to non-IP host; ensure access is restricted at the network layer",
+			"host", host,
+		)
 	}
 
 	mux := http.NewServeMux()
+	// Two metrics endpoints are mounted intentionally:
+	//   /metrics         — application metrics supplied by the caller
+	//                      (typically a Prometheus collector).
+	//   /logger-metrics  — structured logger counters (log-level breakdown,
+	//                      dropped-record counters, sampling stats) provided
+	//                      by the logger/v4 package. Kept on a separate path
+	//                      so scrapers can target one or both independently
+	//                      and the application handler never sees logger
+	//                      internals on its own route.
 	mux.Handle("/metrics", cfg.Handler)
 	mux.Handle("/logger-metrics", logger.MetricsHandler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {

@@ -2,8 +2,6 @@ package middleware
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"net/http"
 	"strings"
 
@@ -153,15 +151,11 @@ func formatTraceparent(info TraceInfo) string {
 }
 
 func generateTraceID() string {
-	b := make([]byte, traceIDLen)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+	return randomHex(traceIDLen)
 }
 
 func generateSpanID() string {
-	b := make([]byte, spanIDLen)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+	return randomHex(spanIDLen)
 }
 
 // isLowerHex reports whether s contains only lowercase hex digits.

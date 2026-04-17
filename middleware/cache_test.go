@@ -89,24 +89,21 @@ func TestHTTPCache_EmptyPrefixBypass(t *testing.T) {
 
 func TestHTTPCache_ColonInPrefixBypass(t *testing.T) {
 	store := newTestStore(t)
-	calls := 0
 
-	h := HTTPCache(HTTPCacheConfig{
+	// Finding #21: HTTPCache panics at construction when a static KeyPrefix
+	// returns a value containing ':' for a probe request, because such a
+	// prefix silently breaks prefix-bucket isolation in the cache store.
+	// Fail-fast is preferred over the previous silent runtime bypass.
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected HTTPCache to panic for static KeyPrefix containing ':'")
+		}
+	}()
+
+	HTTPCache(HTTPCacheConfig{
 		Store:     store,
-		KeyPrefix: staticPrefix("tenant:42"), // colon → bypass
-	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	for range 2 {
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/test", nil))
-	}
-
-	if calls != 2 {
-		t.Fatalf("expected 2 handler calls (colon bypass); got %d", calls)
-	}
+		KeyPrefix: staticPrefix("tenant:42"), // colon → panic at construction
+	})
 }
 
 func TestHTTPCache_NoStoreHeaderBypass(t *testing.T) {

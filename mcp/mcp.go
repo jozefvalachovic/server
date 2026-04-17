@@ -41,6 +41,8 @@
 package mcp
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -118,8 +120,9 @@ func Handler(cfg Config) http.Handler {
 	catalogue := make([]toolDef, 0, len(cfg.Tools))
 	for _, t := range cfg.Tools {
 		catalogue = append(catalogue, toolDef{
-			tool:   t,
-			schema: buildSchema(t.Input),
+			tool:      t,
+			schema:    buildSchema(t.Input),
+			inputType: inputElemType(t.Input),
 		})
 	}
 
@@ -166,6 +169,29 @@ func Handler(cfg Config) http.Handler {
 type toolDef struct {
 	tool   Tool
 	schema inputSchema
+	// inputType is the concrete struct type derived from Tool.Input. Used
+	// to strict-decode tool/call arguments with DisallowUnknownFields before
+	// dispatching to Tool.Handler. nil when Tool.Input is nil (no-param tool).
+	inputType reflect.Type
+}
+
+// inputElemType returns the underlying struct type described by the value
+// passed to Tool.Input. Pointers are dereferenced once so callers may pass
+// either (*T)(nil) or T{}. Returns nil for nil inputs or non-struct types
+// (those will fall through to raw-handler dispatch without validation, so
+// tools remain functional if Input describes a map or primitive).
+func inputElemType(in any) reflect.Type {
+	if in == nil {
+		return nil
+	}
+	t := reflect.TypeOf(in)
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return nil
+	}
+	return t
 }
 
 type server struct {
@@ -251,6 +277,7 @@ const (
 	codeParseError     = -32700
 	codeInvalidRequest = -32600
 	codeMethodNotFound = -32601
+	codeInvalidParams  = -32602
 	codeInternalError  = -32603
 )
 
@@ -373,6 +400,23 @@ func (s *server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 	if p.Arguments == nil {
 		p.Arguments = json.RawMessage("{}")
 	}
+	// Strict-validate arguments against the declared input type before
+	// dispatching. Unknown fields and type mismatches are rejected here so
+	// tool handlers never see silently-dropped fields (a common source of
+	// subtle bugs when agents hallucinate parameter names). Tools with no
+	// declared Input (inputType == nil) skip validation to preserve backwards
+	// compatibility with schemaless handlers.
+	if td.inputType != nil {
+		instance := reflect.New(td.inputType).Interface()
+		dec := json.NewDecoder(bytes.NewReader(p.Arguments))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(instance); err != nil {
+			return nil, &rpcError{
+				Code:    codeInvalidParams,
+				Message: fmt.Sprintf("Invalid arguments for tool %q: %v", p.Name, err),
+			}
+		}
+	}
 	result, err := td.tool.Handler(ctx, p.Arguments)
 	if err != nil {
 		return &toolCallResult{
@@ -477,9 +521,7 @@ func buildSchema(v any) inputSchema {
 			continue
 		}
 		name, rest, _ := strings.Cut(tag, ",")
-		if name == "" {
-			name = sf.Name
-		}
+		name = cmp.Or(name, sf.Name)
 		omitempty := strings.Contains(rest, "omitempty")
 
 		ft := sf.Type

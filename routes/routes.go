@@ -1,6 +1,7 @@
 package routes
 
 import (
+	"fmt"
 	"maps"
 	"net/http"
 	"slices"
@@ -167,6 +168,11 @@ func RegisterRoute(mux *http.ServeMux, route Route) {
 // RegisterRouteList registers multiple routes, grouping those that share a
 // path into a single RouteHandler for consistent 405 Method Not Allowed handling.
 // Per-route middleware is applied to each handler before grouping.
+//
+// Panics when the same (path, method) pair is registered more than once. This
+// is a programming error — silently overwriting the earlier handler would make
+// subtle routing bugs nearly impossible to diagnose in production. Fail fast
+// at startup instead.
 func RegisterRouteList(mux *http.ServeMux, routes []Route) {
 	grouped := make(map[string]Routes)
 	for _, route := range routes {
@@ -177,6 +183,9 @@ func RegisterRouteList(mux *http.ServeMux, routes []Route) {
 		}
 		if grouped[route.Path] == nil {
 			grouped[route.Path] = make(Routes)
+		}
+		if _, exists := grouped[route.Path][route.Method]; exists {
+			panic(fmt.Sprintf("routes: duplicate handler for %s %s", route.Method, route.Path))
 		}
 		grouped[route.Path][route.Method] = handler.ServeHTTP
 	}

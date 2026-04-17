@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"maps"
 	"net/http"
 	"strconv"
@@ -144,10 +145,24 @@ func (h *HealthChecker) Result(ctx context.Context) HealthCheckResult {
 	ch := make(chan entry, len(checks))
 	for name, fn := range checks {
 		go func(name string, fn CheckFunc) {
+			start := time.Now()
+			// Recover panics from check implementations so a single bad check
+			// cannot deadlock Result() waiting on a channel send that never
+			// happens. Report the panic as a down status with latency up to
+			// the panic point.
+			defer func() {
+				if rec := recover(); rec != nil {
+					ch <- entry{name: name, detail: checkDetail{
+						Status:  HealthStatusDown,
+						Error:   fmt.Sprintf("check panicked: %v", rec),
+						Latency: time.Since(start).Round(time.Millisecond).String(),
+					}}
+				}
+			}()
+
 			ctx2, cancel := context.WithTimeout(ctx, h.timeout)
 			defer cancel()
 
-			start := time.Now()
 			err := fn(ctx2)
 			latency := time.Since(start)
 

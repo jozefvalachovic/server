@@ -1,6 +1,7 @@
 package server
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -117,6 +118,11 @@ type TCPServer struct {
 	handler func(conn net.Conn)
 	wg      sync.WaitGroup
 	log     logger.Logger
+
+	// closeListenerOnce guards the net.Listener close so that calling
+	// GracefulShutdown followed by ForceShutdown (the standard escalation
+	// pattern) does not attempt to close the listener twice.
+	closeListenerOnce sync.Once
 }
 
 // NewTCPServer initializes a new TCPServer instance.
@@ -185,10 +191,7 @@ func NewTCPServer(handler func(conn net.Conn), appName, appVersion string, cfg T
 	maxConns := config.GetTCPMaxConns()
 	log.LogInfo("TCP server configured", "maxConns", maxConns)
 
-	rejectMsg := cfg.RejectMessage
-	if rejectMsg == "" {
-		rejectMsg = "-ERR server at max capacity, try again later\r\n"
-	}
+	rejectMsg := cmp.Or(cfg.RejectMessage, "-ERR server at max capacity, try again later\r\n")
 
 	readTimeout := max(cfg.ReadTimeout, 0)
 	writeTimeout := max(cfg.WriteTimeout, 0)
@@ -398,14 +401,16 @@ func (c *deadlineConn) Close() error {
 // GracefulShutdown handles graceful shutdown on termination signals.
 // The caller controls the deadline via ctx (typically context.WithTimeout).
 // Returns the first non-nil error encountered.
+//
+// Safe to follow with ForceShutdown as an escalation if the graceful deadline
+// is exceeded — listener close is guarded by sync.Once.
 func (s *TCPServer) GracefulShutdown(ctx context.Context) error {
 	s.log.LogInfo("Starting graceful shutdown...")
+	// Close the listener before cancelling the context so no new connections
+	// can be accepted after shutdown starts. Accept() returns net.ErrClosed
+	// immediately, which the accept loop treats as the shutdown signal.
+	s.closeListener()
 	s.cancel()
-	if s.listener != nil {
-		if err := s.listener.Close(); err != nil {
-			s.log.LogWarn("Error closing TCP listener during graceful shutdown", "error", err.Error())
-		}
-	}
 
 	done := make(chan struct{})
 	go func() {
@@ -450,16 +455,31 @@ func (s *TCPServer) GetActiveConnections() int64 {
 	return s.activeConns.Load()
 }
 
+// closeListener closes the net.Listener exactly once across repeated or
+// interleaved GracefulShutdown / ForceShutdown calls. net.Listener.Close is
+// not idempotent (second call returns *PathError wrapping ErrClosed), so
+// wrapping in sync.Once avoids spurious warning log spam during the common
+// "graceful → force escalate" path.
+func (s *TCPServer) closeListener() {
+	s.closeListenerOnce.Do(func() {
+		if s.listener == nil {
+			return
+		}
+		if err := s.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			s.log.LogWarn("Error closing TCP listener", "error", err.Error())
+		}
+	})
+}
+
 // ForceShutdown immediately stops the server without waiting for ongoing connections.
 // All active connections are closed immediately.
+//
+// Safe to call multiple times and safe to call after GracefulShutdown as an
+// escalation — listener close is guarded by sync.Once.
 func (s *TCPServer) ForceShutdown() {
 	s.log.LogInfo("Forcefully closing TCP server...")
+	s.closeListener()
 	s.cancel()
-	if s.listener != nil {
-		if err := s.listener.Close(); err != nil {
-			s.log.LogWarn("Error closing TCP listener during force shutdown", "error", err.Error())
-		}
-	}
 
 	// Close every tracked connection immediately.
 	s.conns.Range(func(key, _ any) bool {

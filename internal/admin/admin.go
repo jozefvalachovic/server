@@ -59,6 +59,16 @@ type Config struct {
 	// Store is the application cache store. Used by the /cache/ section.
 	// nil disables cache-related features.
 	Store *cache.CacheStore
+	// TrustXForwardedProto, when true, allows the admin auth layer to treat
+	// X-Forwarded-Proto: https as a signal that the outer request was HTTPS
+	// and therefore set the Secure flag on session/CSRF cookies. Default
+	// false: the Secure flag is set only when r.TLS is populated (i.e. the
+	// Go server terminated TLS directly). Enable only when the admin is
+	// served behind a trusted reverse proxy that strips / overrides
+	// incoming X-Forwarded-Proto headers from the client, otherwise an
+	// attacker on plain HTTP could spoof the header and prevent Secure from
+	// being set on responses (no privilege gain, but surprising behaviour).
+	TrustXForwardedProto bool
 }
 
 // adminCSP allows same-origin CSS and JS for the admin UI pages.
@@ -86,6 +96,11 @@ func withCSP(h http.HandlerFunc) http.HandlerFunc {
 //	/cache/entry/{k}  — DELETE a single cache key (AJAX, protected)
 //	/cache/flush      — POST to flush all cache keys (AJAX, protected)
 func Register(mux *http.ServeMux, cfg Config) {
+	// Propagate the X-Forwarded-Proto trust decision into the auth helpers.
+	// Stored as a package var rather than threaded through every helper to
+	// keep the existing signatures; admin is not re-entrant so this is safe.
+	trustXFP = cfg.TrustXForwardedProto
+
 	// Warn operators when the admin secret is too short to resist brute-force
 	// attacks on the HMAC-SHA256 session cookie.
 	if _, secret := adminCreds(); secret != "" && len(secret) < 32 {
