@@ -110,7 +110,7 @@ type CachedResponse struct {
 	StatusCode int         `json:"statusCode"`
 	Headers    http.Header `json:"headers"`
 	Body       []byte      `json:"body"`
-	FreshUntil time.Time   `json:"freshUntil,omitempty"`
+	FreshUntil time.Time   `json:"freshUntil,omitzero"`
 }
 
 const cacheShards = 16
