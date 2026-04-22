@@ -251,14 +251,19 @@ func cachePageHandler(cfg Config, w http.ResponseWriter, _ *http.Request) {
 		val := m["value"]
 		typeName := reflect.TypeOf(val).String()
 		var bytesEst int64
-		switch rv := val.(type) {
-		case []byte:
-			bytesEst = int64(len(rv))
-		case string:
-			bytesEst = int64(len(rv))
-		default:
-			raw, _ := json.Marshal(rv)
-			bytesEst = int64(len(raw))
+		if b, ok := m["bytes"].(int64); ok && b > 0 {
+			// Prefer the precise footprint recorded at insertion time.
+			bytesEst = b
+		} else {
+			switch rv := val.(type) {
+			case []byte:
+				bytesEst = int64(len(rv))
+			case string:
+				bytesEst = int64(len(rv))
+			default:
+				raw, _ := json.Marshal(rv)
+				bytesEst = int64(len(raw))
+			}
 		}
 
 		entries = append(entries, entryRow{
@@ -290,8 +295,48 @@ func cacheDeleteHandler(cfg Config, w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing key", http.StatusBadRequest)
 		return
 	}
+	// Defensive charset guard: even though the current *cache.CacheStore is a
+	// flat map[string]entry (so traversal-style keys simply delete a literal
+	// string), alternative CacheBackend implementations may be hierarchical
+	// (filesystem, Redis keyspace, blob store). Keep the admin API honest by
+	// rejecting anything outside a conservative charset before dispatching.
+	if !isSafeCacheKey(key) {
+		http.Error(w, "invalid key", http.StatusBadRequest)
+		return
+	}
 	cfg.Store.Delete(key)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// isSafeCacheKey reports whether key is a conservative byte sequence suitable
+// for use against arbitrary CacheBackend implementations. The allowed set is
+// ASCII alphanumerics plus `.`, `_`, `-`, `:`, `/`, capped at 512 bytes. `/`
+// is allowed because existing cache key prefixes embed request paths; the
+// cache backend treats keys opaquely so no filesystem resolution occurs.
+func isSafeCacheKey(key string) bool {
+	if key == "" || len(key) > 512 {
+		return false
+	}
+	// Reject parent-directory segments defensively. The current backend does
+	// not resolve paths, but an operator swapping in a filesystem-backed
+	// store should not have to re-audit this handler.
+	if key == ".." || strings.Contains(key, "/..") || strings.HasPrefix(key, "../") {
+		return false
+	}
+	for i := range len(key) {
+		c := key[i]
+		switch {
+		case c >= 'A' && c <= 'Z',
+			c >= 'a' && c <= 'z',
+			c >= '0' && c <= '9':
+			continue
+		case c == '.' || c == '_' || c == '-' || c == ':' || c == '/':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func cacheFlushHandler(cfg Config, w http.ResponseWriter, _ *http.Request) {

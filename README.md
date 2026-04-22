@@ -398,6 +398,22 @@ The `CacheBackend` interface (`Get`, `Set`, `Delete`, `DeleteByPrefix`) can be s
 
 Invalidation: a 2xx response to a method in `InvalidateMethods` deletes all entries under the request's key prefix.
 
+**Ordering with Compress:** `HTTPCache` must sit **before** `Compress` in the middleware chain so it stores uncompressed bodies and `Compress` re-encodes them per request. This keeps one entry per URL rather than one per `Accept-Encoding` variant, and avoids serving pre-gzipped bytes to clients that do not accept gzip. The middleware explicitly rejects any response already carrying a `Content-Encoding` header to make the violation a cache miss rather than a silent corruption. `HTTPCache` intentionally does **not** honour `Cache-Control: no-cache` / `private` on responses — eligibility is decided by method, status, and the caller's `KeyPrefix`.
+
+**Stale-while-revalidate (optional):**
+
+```go
+cached := middleware.HTTPCache(middleware.HTTPCacheConfig{
+    Store:                store,
+    TTL:                  60 * time.Second,  // fresh window
+    StaleWhileRevalidate: 5 * time.Minute,   // serve stale + refresh in background
+    StaleIfError:         5 * time.Minute,   // serve stale on handler 5xx
+    KeyPrefix:            keyFn,
+})
+```
+
+When `StaleWhileRevalidate > 0`, requests that arrive after `TTL` but within the stale window are served immediately with `X-Cache: STALE` and a background refresh is dispatched through `singleflight` so only one handler run per key, regardless of concurrency. `StaleIfError` extends the same stale window for the specific case of a non-2xx refresh: the previous good body is replayed with `X-Cache: STALE-ERROR` instead of surfacing the error to clients. Both default to zero (disabled) — behaviour is identical to the pre-SWR code path until you opt in. Entries are held in the store for `TTL + StaleWhileRevalidate + StaleIfError`, so cache memory scales accordingly.
+
 ### CORS
 
 ```go
@@ -549,6 +565,7 @@ middleware.Timeout(middleware.TimeoutConfig{
     Timeout:      10 * time.Second,
     ErrorMessage: "Request timed out. Please try again.",
     SkipPaths:    []string{"/events", "/stream/"},
+    SSEPaths:     []string{"/sse/"},              // convenience; appended to SkipPaths
 })
 ```
 
@@ -557,13 +574,18 @@ middleware.Timeout(middleware.TimeoutConfig{
 | `Timeout`      | `time.Duration` | 30 s                                   | Per-request handler deadline                               |
 | `ErrorMessage` | `string`        | "Request timed out. Please try again." | Message in the 504 response body                           |
 | `SkipPaths`    | `[]string`      | none                                   | Exact or prefix paths (trailing `/`) exempt from timeout   |
+| `SSEPaths`     | `[]string`      | none                                   | Convenience for streaming routes; merged into `SkipPaths`  |
 
 When the deadline fires, a 504 response is written and `r.Context()` is cancelled. If the handler already committed a response, no 504 is injected. Panics inside the timeout goroutine are recovered.
 
-> **SSE / long-poll note:** List SSE or streaming endpoint paths in `SkipPaths`
-> to exempt them from the per-request deadline. Also ensure SSE handlers send
-> heartbeats within the server's `IdleTimeout` (default 30 s) to prevent the
-> HTTP server from closing the idle connection. See `response.SSEWriter.SendHeartbeat`.
+> **SSE / long-poll note:** List SSE or streaming endpoint paths in `SSEPaths`
+> (or `SkipPaths`) to exempt them from the per-request deadline. Streams are
+> also capped by `http.Server.WriteTimeout`, so set `HTTPServerConfig.NoWriteTimeout = true`
+> (or serve streams from a dedicated server) to avoid connection-level cut-offs.
+> `NewHTTPServer` logs a warning on startup if `SSEPaths` is set while
+> `WriteTimeout` is non-zero. Also ensure SSE handlers send heartbeats within
+> the server's `IdleTimeout` (default 30 s) to prevent the HTTP server from
+> closing the idle connection. See `response.SSEWriter.SendHeartbeat`.
 
 ### Request ID
 

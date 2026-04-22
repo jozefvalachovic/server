@@ -1,12 +1,9 @@
 package middleware
 
 import (
-	"errors"
 	"net/http"
 	"os"
 	"strconv"
-
-	"github.com/jozefvalachovic/logger/v4"
 )
 
 // RequestSizeConfig configures the RequestSize middleware.
@@ -43,26 +40,13 @@ func RequestSizeWithConfig(cfg RequestSizeConfig) func(http.Handler) http.Handle
 			// the limit is exceeded; the standard library writes a 413 response.
 			r.Body = http.MaxBytesReader(w, r.Body, maxSize)
 
+			// http.MaxBytesReader writes 413 to the client automatically when
+			// the handler reads past the limit, and returns *http.MaxBytesError
+			// to the handler. Observability (logging / metrics) of over-limit
+			// bodies is the handler's responsibility — it already has the error
+			// in hand. See response.DecodeBody for an example helper that turns
+			// MaxBytesError into a structured 413 JSON response.
 			next.ServeHTTP(w, r)
-
-			// If MaxBytesReader triggered, the standard library has already
-			// written a 413 to the wire. We log so operators have visibility.
-			if r.Body != nil {
-				// After ServeHTTP, if the body exceeded the limit an error was
-				// returned to the handler. We detect this by trying a zero-byte
-				// read (cheap) — if MaxBytesError is already set, Read returns
-				// immediately with the error.
-				var buf [0]byte
-				if _, err := r.Body.Read(buf[:]); err != nil {
-					if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
-						logger.LogWarn("Request body exceeded size limit",
-							"method", r.Method,
-							"path", r.URL.Path,
-							"maxSizeMB", maxSize/(1024*1024),
-						)
-					}
-				}
-			}
 		})
 	}
 }

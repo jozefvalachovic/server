@@ -213,13 +213,29 @@ var timeType = reflect.TypeFor[time.Time]()
 // schemaFields reflects t into a slice of Fields for the template.
 // Anonymous (embedded) struct fields — e.g. Base — are inlined so their
 // fields appear flat in the schema, matching JSON output.
+//
+// A per-call visited set breaks recursion on self-referential structs (e.g.
+// linked-list nodes, tree types), returning an empty child list when the same
+// struct type is encountered twice in the same path. Without this guard the
+// reflection walk would recurse indefinitely and panic with "stack overflow".
 func schemaFields(t reflect.Type) []Field {
+	return schemaFieldsVisited(t, map[reflect.Type]struct{}{})
+}
+
+func schemaFieldsVisited(t reflect.Type, visited map[reflect.Type]struct{}) []Field {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	if t.Kind() != reflect.Struct {
 		return nil
 	}
+	if _, seen := visited[t]; seen {
+		// Cycle detected — emit no further nesting. The field still appears
+		// in the parent schema with its type label.
+		return nil
+	}
+	visited[t] = struct{}{}
+	defer delete(visited, t)
 
 	var out []Field
 	for sf := range t.Fields() {
@@ -228,7 +244,7 @@ func schemaFields(t reflect.Type) []Field {
 		}
 		// Inline embedded structs (Base → ID, CreatedAt, … appear flat).
 		if sf.Anonymous {
-			out = append(out, schemaFields(sf.Type)...)
+			out = append(out, schemaFieldsVisited(sf.Type, visited)...)
 			continue
 		}
 
@@ -252,7 +268,7 @@ func schemaFields(t reflect.Type) []Field {
 		typeName := goTypeName(ft)
 		var children []Field
 		if ft.Kind() == reflect.Struct && ft != timeType {
-			children = schemaFields(ft)
+			children = schemaFieldsVisited(ft, visited)
 		}
 
 		out = append(out, Field{

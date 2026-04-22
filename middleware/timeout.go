@@ -44,6 +44,30 @@ type TimeoutConfig struct {
 	//	    SkipPaths: []string{"/events", "/stream/"},
 	//	})
 	SkipPaths []string
+
+	// SSEPaths is a convenience field equivalent to appending to SkipPaths, with
+	// the explicit intent of documenting which routes stream responses (SSE,
+	// long-poll, chunked downloads). Entries are merged into the effective
+	// skip set at middleware construction.
+	//
+	// Separating SSEPaths from SkipPaths keeps the call-site intent readable —
+	// SkipPaths is "don't time out", SSEPaths is "this route streams". Both
+	// accept exact paths or prefix paths ending in '/'.
+	//
+	// Note: the per-request Timeout middleware is only one layer. The enclosing
+	// http.Server also has a WriteTimeout that, when non-zero, caps the total
+	// response duration regardless of this middleware. For streaming endpoints
+	// ensure HTTPServerConfig.WriteTimeout is 0 (or NoWriteTimeout is true).
+	// NewHTTPServer emits a warning at startup if both SSEPaths and a non-zero
+	// WriteTimeout are configured together.
+	//
+	// Example:
+	//
+	//	middleware.Timeout(middleware.TimeoutConfig{
+	//	    Timeout:   30 * time.Second,
+	//	    SSEPaths:  []string{"/events", "/stream/"},
+	//	})
+	SSEPaths []string
 }
 
 // Timeout enforces a per-request deadline on every handler in the chain.
@@ -109,8 +133,13 @@ func Timeout(cfgs ...TimeoutConfig) func(http.Handler) http.Handler {
 	timeout := cfg.Timeout
 	errMsg := cfg.ErrorMessage
 
-	// Pre-compute skip sets for O(1) exact match and prefix scanning.
-	skip := newPathSkipper(cfg.SkipPaths)
+	// Merge SSEPaths into the effective skip set — callers set SSEPaths purely
+	// for intent documentation; internally it is equivalent to SkipPaths.
+	skipPaths := cfg.SkipPaths
+	if len(cfg.SSEPaths) > 0 {
+		skipPaths = append(skipPaths[:len(skipPaths):len(skipPaths)], cfg.SSEPaths...)
+	}
+	skip := newPathSkipper(skipPaths)
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

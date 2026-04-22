@@ -133,7 +133,7 @@ func IPFilter(cfgs ...IPFilterConfig) func(http.Handler) http.Handler {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ip := clientIP(r, cfg.TrustForwardedFor, state.proxyNets)
+			ip := clientIPFromRequest(r, cfg.TrustForwardedFor, state.proxyNets)
 			parsed := net.ParseIP(ip)
 			if parsed == nil {
 				// Cannot determine IP — deny for safety.
@@ -167,53 +167,6 @@ func IPFilter(cfgs ...IPFilterConfig) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
-}
-
-func clientIP(r *http.Request, trustForwarded bool, proxyNets []*net.IPNet) string {
-	if trustForwarded && len(proxyNets) > 0 {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			// Walk the XFF list from right to left, skipping entries that are
-			// trusted proxies. The first non-trusted entry is the real client IP.
-			//
-			// Iterate in place with strings.LastIndexByte rather than allocating
-			// a full []string via strings.Split. Under XFF-heavy load (DDoS via
-			// header spam, for example) this removes a per-request allocation
-			// and cuts GC pressure on the hottest path in the filter.
-			end := len(xff)
-			for end > 0 {
-				start := strings.LastIndexByte(xff[:end], ',') + 1
-				candidate := strings.TrimSpace(xff[start:end])
-				end = start - 1 // skip the comma for the next iteration
-				if candidate == "" {
-					continue
-				}
-				candidateIP := net.ParseIP(candidate)
-				if candidateIP == nil {
-					continue
-				}
-				if isTrustedProxy(candidateIP, proxyNets) {
-					continue
-				}
-				return candidate
-			}
-		}
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
-}
-
-// isTrustedProxy reports whether ip is within any of the trusted proxy CIDRs.
-// When no CIDRs are configured, every address is treated as untrusted (safe default).
-func isTrustedProxy(ip net.IP, proxyNets []*net.IPNet) bool {
-	for _, n := range proxyNets {
-		if n.Contains(ip) {
-			return true
-		}
-	}
-	return false
 }
 
 func writeForbidden(w http.ResponseWriter) {

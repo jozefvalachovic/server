@@ -1,6 +1,8 @@
 package cache
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"maps"
 	"net/url"
 	"slices"
@@ -33,7 +35,9 @@ func BuildResponseKey(prefix, urlPath, rawQuery string) string {
 }
 
 // sortedQuery returns a deterministic query string with parameters sorted by key,
-// then by value. Malformed query strings are returned as-is.
+// then by value. Malformed query strings are replaced with a stable SHA-256
+// hash of the raw bytes (prefixed with "h:") so that the cache key remains
+// bounded in length and does not echo unparseable user input verbatim.
 func sortedQuery(rawQuery string) string {
 	if rawQuery == "" {
 		return ""
@@ -41,8 +45,13 @@ func sortedQuery(rawQuery string) string {
 
 	params, err := url.ParseQuery(rawQuery)
 	if err != nil {
-		// Cannot parse — use raw value to avoid dropping the query entirely.
-		return rawQuery
+		// Cannot parse — fall back to a stable hash of the raw bytes. Two
+		// requests with the same malformed query still resolve to the same
+		// key (preserving cache benefit) while avoiding unbounded key growth
+		// and avoiding leaking raw query bytes into log-sinks that might
+		// consume the key verbatim.
+		sum := sha256.Sum256([]byte(rawQuery))
+		return "h:" + hex.EncodeToString(sum[:8])
 	}
 
 	keys := slices.Sorted(maps.Keys(params))

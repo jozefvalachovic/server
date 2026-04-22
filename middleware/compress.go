@@ -52,8 +52,13 @@ type gzipResponseWriter struct {
 func (g *gzipResponseWriter) activate() {
 	g.decided = true
 	ct := g.Header().Get("Content-Type")
-	eligible := ct == "" // optimistic when Content-Type not yet declared
-	if !eligible {
+	// Eligibility requires an explicit Content-Type header that matches one of
+	// the configured prefixes. Handlers that forget to set Content-Type (common
+	// for pre-encoded binary payloads) are not compressed — stdlib’s automatic
+	// content-type sniffing runs on the first Write, which is AFTER we decide
+	// here, so "missing" must be treated as ineligible rather than optimistic.
+	eligible := false
+	if ct != "" {
 		for _, t := range g.types {
 			if strings.HasPrefix(ct, t) {
 				eligible = true
@@ -167,6 +172,16 @@ func Compress(cfgs ...CompressConfig) func(http.Handler) http.Handler {
 			if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 				// Vary must be set even when compression is not applied so that
 				// shared caches (CDNs) store separate variants for gzip vs plain.
+				w.Header().Add("Vary", "Accept-Encoding")
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// RFC 7233 §6: byte-range responses must not be transformed —
+			// compressing a range response invalidates the client’s byte offsets.
+			// Pass through unchanged but advertise that the cache key varies by
+			// Accept-Encoding so intermediaries store separate representations.
+			if r.Header.Get("Range") != "" {
 				w.Header().Add("Vary", "Accept-Encoding")
 				next.ServeHTTP(w, r)
 				return

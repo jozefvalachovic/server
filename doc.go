@@ -87,4 +87,65 @@
 //
 // Custom middleware passed via Middlewares runs after all built-in layers and
 // before the handler. Index 0 executes first.
+//
+// # HTTPCache placement
+//
+// The HTTPCache middleware is NOT part of the built-in stack — it is applied
+// per-route via CachedRouteHandler. When combined with Compress, HTTPCache must
+// execute BEFORE Compress so it stores uncompressed bodies and Compress re-encodes
+// them per request. This keeps one cache entry per Accept-Encoding variant and
+// avoids storing pre-gzipped bodies that would be served to clients that do not
+// accept gzip. The middleware rejects any response already carrying a
+// Content-Encoding header to enforce this ordering at runtime.
+//
+// HTTPCache intentionally does NOT honour Cache-Control: no-cache, no-store or
+// private on responses; eligibility is decided by status code, method and the
+// caller's key-prefix. Callers who need RFC 9111 semantics should wrap their
+// handlers accordingly.
+//
+// # Graceful shutdown
+//
+// Bind the server lifetime to OS signals so Kubernetes can drain the pod cleanly
+// on rollout:
+//
+//	srv, _ := server.NewHTTPServer(mux, "my-app", "1.0.0", server.HTTPServerConfig{})
+//	if err := srv.Start(); err != nil {
+//	    log.Fatal(err)
+//	}
+//
+//	sig := make(chan os.Signal, 1)
+//	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+//	<-sig
+//
+//	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+//	defer cancel()
+//	if err := srv.GracefulShutdown(ctx); err != nil {
+//	    srv.ForceShutdown() // deadline exceeded — close active connections
+//	}
+//
+// Alternatively, StartWithContext wires cancellation for you:
+//
+//	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+//	defer cancel()
+//	_ = srv.StartWithContext(ctx) // GracefulShutdown runs when ctx is cancelled
+//
+// # Health and readiness
+//
+// Register /health (liveness) and /readiness (dependencies) so Kubernetes can
+// distinguish process-is-alive from ready-to-serve-traffic. Mark dependencies
+// whose failure should drain the pod with RegisterCritical:
+//
+//	hc := server.NewHealthChecker("1.0.0", 5*time.Second)
+//	hc.RegisterCritical("postgres", func(ctx context.Context) error {
+//	    return db.PingContext(ctx)
+//	})
+//	hc.Register("redis", func(ctx context.Context) error {
+//	    return rdb.Ping(ctx).Err()
+//	})
+//	mux.HandleFunc("GET /health",    hc.LivenessHandler())
+//	mux.HandleFunc("GET /readiness", hc.ReadinessHandler())
+//
+// Liveness returns 200 unconditionally (process-is-alive). Readiness returns
+// 503 when any critical check fails or when every registered check is down;
+// a degraded state returns 200 so the pod remains in rotation.
 package server

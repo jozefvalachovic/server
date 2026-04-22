@@ -181,6 +181,9 @@ func extractCredential(r *http.Request, scheme AuthScheme, apiKeyHeader string) 
 		if !ok {
 			return "", false
 		}
+		// RFC 7235 permits optional whitespace around the token; trim it so
+		// clients that append trailing OWS still authenticate successfully.
+		token = strings.TrimSpace(token)
 		return token, token != ""
 	}
 }

@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/jozefvalachovic/server/response"
+
+	"github.com/jozefvalachovic/logger/v4"
 )
 
 // ErrRateLimitExceeded is a sentinel error for programmatic detection of
@@ -117,8 +119,29 @@ type HTTPRateLimitConfig struct {
 	Burst int
 
 	// KeyFunc extracts the per-client key used to identify a caller.
-	// Default: remote IP address (host portion only).
+	// When nil, the key is derived from the client IP. If TrustedProxies is
+	// set, the X-Forwarded-For header is walked right-to-left, skipping
+	// trusted-proxy hops — otherwise r.RemoteAddr’s host portion is used.
+	//
+	// SECURITY: behind a reverse proxy (Kubernetes Ingress, CloudFront,
+	// Cloudflare, service mesh) r.RemoteAddr is always the proxy’s IP, so the
+	// default KeyFunc collapses every client onto one bucket. Either set
+	// TrustedProxies (preferred) or supply a KeyFunc that extracts the client
+	// identity yourself — otherwise attackers can bypass the limit by spoofing
+	// X-Forwarded-For.
 	KeyFunc func(*http.Request) string
+
+	// TrustForwardedFor enables X-Forwarded-For-based key extraction when
+	// KeyFunc is nil. Requires TrustedProxies to be set; without at least one
+	// trusted proxy the middleware ignores XFF and falls back to RemoteAddr.
+	// Default: false.
+	TrustForwardedFor bool
+
+	// TrustedProxies is the set of CIDR ranges or exact IPs of reverse proxies
+	// whose X-Forwarded-For headers are trusted. Used only when KeyFunc is nil
+	// and TrustForwardedFor is true. Shares semantics with IPFilterConfig’s
+	// field of the same name — see IPFilter docs for the full walker contract.
+	TrustedProxies []string
 
 	// StatusCode is returned to rejected requests.
 	// Default: 429 Too Many Requests.
@@ -180,7 +203,13 @@ func HTTPRateLimit(cfgs ...HTTPRateLimitConfig) func(http.Handler) http.Handler 
 		cfg.IdleTimeout = 5 * time.Minute
 	}
 	if cfg.KeyFunc == nil {
-		cfg.KeyFunc = remoteIP
+		proxyNets := parseTrustedProxies("HTTPRateLimit.TrustedProxies", cfg.TrustedProxies)
+		if cfg.TrustForwardedFor && len(proxyNets) == 0 {
+			logger.LogWarn("HTTPRateLimit: TrustForwardedFor is enabled but no valid TrustedProxies configured — X-Forwarded-For will be ignored, falling back to RemoteAddr")
+		}
+		cfg.KeyFunc = func(r *http.Request) string {
+			return clientIPFromRequest(r, cfg.TrustForwardedFor, proxyNets)
+		}
 	}
 
 	buckets := newShardedBuckets()
@@ -244,15 +273,6 @@ func HTTPRateLimit(cfgs ...HTTPRateLimitConfig) func(http.Handler) http.Handler 
 			next.ServeHTTP(w, r)
 		})
 	}
-}
-
-// remoteIP extracts the host portion of r.RemoteAddr, stripping the port.
-func remoteIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }
 
 // ── TCP rate limiting ──────────────────────────────────────────────────────

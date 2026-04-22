@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -183,9 +184,9 @@ func NewTCPServer(handler func(conn net.Conn), appName, appVersion string, cfg T
 	}
 	tcpMiddlewareStack = append(tcpMiddlewareStack, cfg.Middlewares...) // App-specific middlewares
 
-	// Apply middleware in reverse order (innermost last)
-	for i := len(tcpMiddlewareStack) - 1; i >= 0; i-- {
-		handler = tcpMiddlewareStack[i](handler)
+	// Apply middleware in reverse order (innermost last).
+	for _, mw := range slices.Backward(tcpMiddlewareStack) {
+		handler = mw(handler)
 	}
 
 	maxConns := config.GetTCPMaxConns()
@@ -244,6 +245,14 @@ func (s *TCPServer) Start() error {
 	}
 	if err != nil {
 		s.log.LogError("Failed to start TCP listener", "error", err.Error())
+		// Clean up the metrics sidecar we just started so it does not leak its
+		// listener when Start() fails before the main listener is bound.
+		if s.metricsServer != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = s.metricsServer.Shutdown(ctx)
+			cancel()
+			s.metricsServer = nil
+		}
 		return err
 	}
 	s.listener = ln

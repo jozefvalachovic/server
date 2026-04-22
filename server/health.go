@@ -112,6 +112,27 @@ func (h *HealthChecker) Deregister(name string) {
 	h.mu.Unlock()
 }
 
+// SetCritical promotes an already-registered check to critical, or demotes a
+// critical check back to non-critical. Returns true when the check exists.
+//
+// Use this when the criticality of a dependency is determined after
+// registration — for example, a cache that is optional at boot but becomes
+// critical after a migration window. Safe to call concurrently with Register
+// and Result.
+func (h *HealthChecker) SetCritical(name string, critical bool) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, ok := h.checks[name]; !ok {
+		return false
+	}
+	if critical {
+		h.critical[name] = struct{}{}
+	} else {
+		delete(h.critical, name)
+	}
+	return true
+}
+
 // SetRedactCheckNames controls whether check names are replaced with generic
 // keys (check_0, check_1 …) in ReadinessHandler responses. Enable this for
 // externally-exposed probes to avoid leaking dependency topology to untrusted

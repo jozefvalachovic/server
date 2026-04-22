@@ -114,10 +114,15 @@ func parseTraceparent(header string) TraceInfo {
 		}
 	}
 
-	// Expected format: {version}-{trace-id}-{parent-id}-{trace-flags}
+	// Expected format for version 00: {version}-{trace-id}-{parent-id}-{trace-flags}
 	// Example: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+	//
+	// W3C §3.2.2.1 requires implementations to accept future versions: the first
+	// four dash-separated fields MUST remain parseable, and additional fields
+	// MUST be tolerated and ignored. We therefore accept len(parts) >= 4 and
+	// inspect only the first four. Version "ff" is reserved as invalid per spec.
 	parts := strings.Split(header, "-")
-	if len(parts) != 4 {
+	if len(parts) < 4 {
 		return TraceInfo{
 			TraceID:    generateTraceID(),
 			SpanID:     newSpan,
@@ -127,7 +132,7 @@ func parseTraceparent(header string) TraceInfo {
 
 	version, traceID, parentID, flags := parts[0], parts[1], parts[2], parts[3]
 
-	if len(version) != 2 || !isLowerHex(version) ||
+	if len(version) != 2 || !isLowerHex(version) || version == "ff" ||
 		len(traceID) != 32 || !isLowerHex(traceID) || isAllZero(traceID) ||
 		len(parentID) != 16 || !isLowerHex(parentID) || isAllZero(parentID) ||
 		len(flags) != 2 || !isLowerHex(flags) {
@@ -138,6 +143,9 @@ func parseTraceparent(header string) TraceInfo {
 		}
 	}
 
+	// Version 00 has no additional fields. Future versions MAY add fields after
+	// trace-flags; we preserve the incoming trace-id/flags and generate a fresh
+	// span-id regardless of version, which is the spec-mandated behaviour.
 	return TraceInfo{
 		TraceID:      traceID,
 		SpanID:       newSpan,

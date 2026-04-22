@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -620,5 +621,137 @@ func TestHTTPCache_CustomInvalidateMethods_OnlyPATCHInvalidates(t *testing.T) {
 	}
 	if getCalls != 2 {
 		t.Fatalf("handler must be called again after PATCH invalidation; got %d calls", getCalls)
+	}
+}
+
+// ── Stale-while-revalidate ─────────────────────────────────────────────────
+
+func TestHTTPCache_SWR_StaleHitServesBodyAndRefreshes(t *testing.T) {
+	store := newTestStore(t)
+	var calls atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("v" + string(rune('0'+n))))
+	})
+	h := HTTPCache(HTTPCacheConfig{
+		Store:                store,
+		KeyPrefix:            staticPrefix("t"),
+		TTL:                  50 * time.Millisecond,
+		StaleWhileRevalidate: 5 * time.Second,
+	})(handler)
+
+	// Miss → populate.
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if rec1.Header().Get("X-Cache") != "MISS" {
+		t.Fatalf("first request: want MISS, got %q", rec1.Header().Get("X-Cache"))
+	}
+
+	// Wait for TTL to expire but remain within the stale window.
+	time.Sleep(80 * time.Millisecond)
+
+	// Stale hit: body served immediately, background refresh dispatched.
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if rec2.Header().Get("X-Cache") != "STALE" {
+		t.Fatalf("second request (stale): want STALE, got %q", rec2.Header().Get("X-Cache"))
+	}
+	if rec2.Body.String() != "v1" {
+		t.Fatalf("stale hit must replay original body; got %q", rec2.Body.String())
+	}
+
+	// Allow background refresh to complete.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && calls.Load() < 2 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if calls.Load() < 2 {
+		t.Fatalf("background refresh did not run; calls=%d", calls.Load())
+	}
+
+	// Next request should be a fresh HIT with the refreshed body.
+	rec3 := httptest.NewRecorder()
+	h.ServeHTTP(rec3, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if got := rec3.Header().Get("X-Cache"); got != "HIT" {
+		t.Fatalf("post-refresh: want HIT, got %q", got)
+	}
+	if rec3.Body.String() != "v2" {
+		t.Fatalf("post-refresh body: want v2, got %q", rec3.Body.String())
+	}
+}
+
+func TestHTTPCache_StaleIfError_ServesStaleOn5xx(t *testing.T) {
+	store := newTestStore(t)
+	var calls atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if n == 1 {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("good"))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("boom"))
+	})
+	h := HTTPCache(HTTPCacheConfig{
+		Store:        store,
+		KeyPrefix:    staticPrefix("t"),
+		TTL:          30 * time.Millisecond,
+		StaleIfError: 5 * time.Second,
+	})(handler)
+
+	// Populate.
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if rec1.Body.String() != "good" {
+		t.Fatalf("seed body: want good, got %q", rec1.Body.String())
+	}
+
+	// Expire past TTL; we did not enable SWR, so the entry is not "stale-
+	// hittable" directly — the middleware falls through to the miss path,
+	// the handler returns 5xx, and StaleIfError replays the previous body.
+	time.Sleep(60 * time.Millisecond)
+
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if got := rec2.Header().Get("X-Cache"); got != "STALE-ERROR" {
+		t.Fatalf("expected STALE-ERROR fallback; got %q (status=%d body=%q)",
+			got, rec2.Code, rec2.Body.String())
+	}
+	if rec2.Body.String() != "good" {
+		t.Fatalf("stale-error must replay last-known-good body; got %q", rec2.Body.String())
+	}
+}
+
+func TestHTTPCache_SWR_Disabled_ClassicMissAfterTTL(t *testing.T) {
+	// When both StaleWhileRevalidate and StaleIfError are zero, behaviour must
+	// be indistinguishable from the pre-SWR code path: expired entry → MISS,
+	// not STALE.
+	store := newTestStore(t)
+	var calls atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	h := HTTPCache(HTTPCacheConfig{
+		Store:     store,
+		KeyPrefix: staticPrefix("t"),
+		TTL:       30 * time.Millisecond,
+	})(handler)
+
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/x", nil))
+
+	time.Sleep(60 * time.Millisecond)
+
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if got := rec2.Header().Get("X-Cache"); got == "STALE" || got == "STALE-ERROR" {
+		t.Fatalf("SWR disabled: expected classic MISS/HIT, got %q", got)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("SWR disabled: handler should run twice (miss + miss); got %d", calls.Load())
 	}
 }

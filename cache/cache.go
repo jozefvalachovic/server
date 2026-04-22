@@ -3,6 +3,7 @@ package cache
 import (
 	"container/heap"
 	"errors"
+	"fmt"
 	"hash/maphash"
 	"net/http"
 	"slices"
@@ -50,15 +51,35 @@ func (h *evictHeap) Pop() any {
 	return e
 }
 
-// CacheStats provides observability into cache performance
+// CacheStats provides observability into cache performance.
+//
+// Hits/Misses/Sets/Deletes/Evictions are monotonic counters since store
+// creation. Size/BytesUsed are current-state gauges. MaxSize/MaxMemoryMB
+// echo the configured limits so consumers can compute capacity ratios
+// without needing a separate reference to the original CacheConfig.
+//
+// All fields are safe to marshal to JSON and to export to a metrics
+// backend. The struct is a point-in-time snapshot — it does not update.
 type CacheStats struct {
-	Hits      int64 `json:"hits"`
-	Misses    int64 `json:"misses"`
-	Sets      int64 `json:"sets"`
-	Deletes   int64 `json:"deletes"`
-	Evictions int64 `json:"evictions"`
-	Size      int64 `json:"size"`
-	BytesUsed int64 `json:"bytesUsed"`
+	Hits        int64 `json:"hits"`
+	Misses      int64 `json:"misses"`
+	Sets        int64 `json:"sets"`
+	Deletes     int64 `json:"deletes"`
+	Evictions   int64 `json:"evictions"`
+	Size        int64 `json:"size"`
+	BytesUsed   int64 `json:"bytesUsed"`
+	MaxSize     int   `json:"maxSize"`
+	MaxMemoryMB int   `json:"maxMemoryMB"`
+}
+
+// HitRate returns the cache hit rate as a fraction in [0, 1].
+// Returns 0 when there have been no reads yet.
+func (s CacheStats) HitRate() float64 {
+	reads := s.Hits + s.Misses
+	if reads == 0 {
+		return 0
+	}
+	return float64(s.Hits) / float64(reads)
 }
 
 // CacheConfig holds configuration for cache behavior.
@@ -81,10 +102,15 @@ type CacheConfig struct {
 // Headers contains the full set of response headers (excluding X-Cache, which
 // is derived on every response). The complete header map is replayed on a HIT
 // so that clients receive all original headers (ETag, Content-Disposition, etc.).
+//
+// FreshUntil marks the end of the "fresh" window when the HTTP cache middleware
+// is configured with StaleWhileRevalidate or StaleIfError. When zero the entry
+// is considered fresh for its entire store TTL (pre-SWR behaviour).
 type CachedResponse struct {
 	StatusCode int         `json:"statusCode"`
 	Headers    http.Header `json:"headers"`
 	Body       []byte      `json:"body"`
+	FreshUntil time.Time   `json:"freshUntil,omitempty"`
 }
 
 const cacheShards = 16
@@ -345,21 +371,70 @@ func (cs *CacheStore) Flush() {
 	logger.LogInfo("Cache flushed")
 }
 
+// Warmup bulk-populates the cache for the given keys using the store's
+// default TTL. For each key, valueFn is invoked to produce the value to
+// cache, which is then stored via Set.
+//
+// Intended use is to pre-warm a cold cache after a pod restart or deploy,
+// so that the first real users do not pay cold-miss latency. Typical
+// callers are a post-startup warmup goroutine that loops through a
+// known-hot set of keys.
+//
+// Behaviour:
+//   - valueFn errors are collected and returned together via errors.Join;
+//     other keys still proceed.
+//   - Set errors (e.g. ErrEntryTooLarge) are also collected.
+//   - Existing entries are overwritten (preserving their createdAt via Set's
+//     update semantics, so warmup does not pin hot keys against eviction).
+//   - Safe to call concurrently with normal cache operations. Callers that
+//     need bounded parallelism can invoke Warmup from their own goroutines
+//     using disjoint key slices.
+//
+// Returns nil if all keys succeeded.
+func (cs *CacheStore) Warmup(keys []string, valueFn func(key string) (any, error)) error {
+	if valueFn == nil {
+		return errors.New("cache: Warmup requires a non-nil valueFn")
+	}
+	var errs []error
+	for _, k := range keys {
+		v, err := valueFn(k)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("warmup %q: %w", k, err))
+			continue
+		}
+		if serr := cs.Set(k, v, nil); serr != nil {
+			errs = append(errs, fmt.Errorf("warmup %q: %w", k, serr))
+		}
+	}
+	if len(errs) > 0 {
+		logger.LogWarn("Cache warmup finished with errors",
+			"total", len(keys), "failed", len(errs))
+	} else {
+		logger.LogInfo("Cache warmup complete", "keys", len(keys))
+	}
+	return errors.Join(errs...)
+}
+
 // GetStats returns a consistent snapshot of cache statistics.
-// All fields are read atomically so no lock is required.
+// All counters are read atomically so no lock is required.
+// MaxSize and MaxMemoryMB echo the configured limits at construction time.
 func (cs *CacheStore) GetStats() CacheStats {
 	return CacheStats{
-		Hits:      cs.hits.Load(),
-		Misses:    cs.misses.Load(),
-		Sets:      cs.sets.Load(),
-		Deletes:   cs.deletes.Load(),
-		Evictions: cs.evictions.Load(),
-		Size:      cs.size.Load(),
-		BytesUsed: cs.bytesUsed.Load(),
+		Hits:        cs.hits.Load(),
+		Misses:      cs.misses.Load(),
+		Sets:        cs.sets.Load(),
+		Deletes:     cs.deletes.Load(),
+		Evictions:   cs.evictions.Load(),
+		Size:        cs.size.Load(),
+		BytesUsed:   cs.bytesUsed.Load(),
+		MaxSize:     cs.config.MaxSize,
+		MaxMemoryMB: cs.config.MaxMemoryMB,
 	}
 }
 
-// Export returns all cache data for debugging
+// Export returns all cache data for debugging. The "bytes" field reflects
+// the estimated per-entry footprint recorded at insertion time and can be
+// surfaced in UI / metrics without re-marshalling the value on every render.
 func (cs *CacheStore) Export() map[string]any {
 	exported := make(map[string]any)
 	for i := range cs.shards {
@@ -371,6 +446,7 @@ func (cs *CacheStore) Export() map[string]any {
 				"createdAt": entry.createdAt,
 				"expiresAt": entry.expiresAt,
 				"ttl":       time.Until(entry.expiresAt),
+				"bytes":     entry.bytes,
 			}
 		}
 		s.mu.RUnlock()

@@ -14,11 +14,13 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	neturl "net/url"
 	"strings"
@@ -195,11 +197,119 @@ type Config struct {
 	// CircuitBreaker configures the circuit breaker. nil disables it.
 	CircuitBreaker *CircuitBreakerConfig
 
-	// Transport is the underlying HTTP transport. Default: http.DefaultTransport.
+	// Transport is the underlying HTTP transport. When nil, a dedicated
+	// *http.Transport is constructed per Client using the TransportConfig
+	// knobs below so that independent Clients do not share connection pools.
+	//
+	// Supplying Transport directly bypasses TransportConfig entirely.
 	Transport http.RoundTripper
+
+	// TransportConfig tunes the default transport. Ignored when Transport is
+	// supplied explicitly. See TransportConfig for individual field docs.
+	TransportConfig TransportConfig
+
+	// TLSClientConfig overrides the default TLS configuration (minimum TLS 1.2,
+	// server verification enabled). Ignored when Transport is supplied
+	// explicitly.
+	TLSClientConfig *tls.Config
 
 	// BaseURL is an optional prefix prepended to all relative request paths.
 	BaseURL string
+}
+
+// TransportConfig exposes the connection-pool and handshake knobs of the
+// underlying *http.Transport. Zero values fall back to safe defaults.
+type TransportConfig struct {
+	// TLSHandshakeTimeout caps the TLS handshake duration. Default: 10 s.
+	// A slow-handshake server cannot consume the entire request Timeout.
+	TLSHandshakeTimeout time.Duration
+
+	// IdleConnTimeout is how long an idle keep-alive connection remains in
+	// the pool before being closed. Default: 90 s.
+	IdleConnTimeout time.Duration
+
+	// MaxIdleConns caps the total number of idle connections kept alive.
+	// Default: 100.
+	MaxIdleConns int
+
+	// MaxIdleConnsPerHost caps idle connections per destination host.
+	// Default: 10.
+	MaxIdleConnsPerHost int
+
+	// MaxConnsPerHost limits the total number of connections per host
+	// (active + idle). 0 leaves the stdlib default (unlimited).
+	MaxConnsPerHost int
+
+	// ResponseHeaderTimeout caps the wait for the first response byte after
+	// the request has been sent. 0 disables the bound.
+	ResponseHeaderTimeout time.Duration
+
+	// ExpectContinueTimeout caps the wait for a 100-Continue. Default: 1 s.
+	ExpectContinueTimeout time.Duration
+
+	// DialTimeout caps the TCP dial. Default: 10 s.
+	DialTimeout time.Duration
+
+	// KeepAlive is the TCP keep-alive interval. Default: 30 s.
+	KeepAlive time.Duration
+
+	// DisableCompression disables transparent gzip request negotiation.
+	// Default: false (compression enabled).
+	DisableCompression bool
+
+	// DisableHTTP2 opts out of HTTP/2 negotiation. Default: false (HTTP/2
+	// attempted when the scheme and peer allow it).
+	DisableHTTP2 bool
+}
+
+// newTransport constructs an *http.Transport from TransportConfig, applying
+// the documented defaults. Each call returns a dedicated transport so
+// independent Client instances never share a connection pool.
+func newTransport(tc TransportConfig, tlsCfg *tls.Config) *http.Transport {
+	if tc.TLSHandshakeTimeout <= 0 {
+		tc.TLSHandshakeTimeout = 10 * time.Second
+	}
+	if tc.IdleConnTimeout <= 0 {
+		tc.IdleConnTimeout = 90 * time.Second
+	}
+	if tc.MaxIdleConns <= 0 {
+		tc.MaxIdleConns = 100
+	}
+	if tc.MaxIdleConnsPerHost <= 0 {
+		tc.MaxIdleConnsPerHost = 10
+	}
+	if tc.ExpectContinueTimeout <= 0 {
+		tc.ExpectContinueTimeout = 1 * time.Second
+	}
+	if tc.DialTimeout <= 0 {
+		tc.DialTimeout = 10 * time.Second
+	}
+	if tc.KeepAlive <= 0 {
+		tc.KeepAlive = 30 * time.Second
+	}
+	// ForceAttemptHTTP2 defaults to true; explicit false is honoured because
+	// the zero value is false. Callers can set it explicitly when needed.
+	if tlsCfg == nil {
+		tlsCfg = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
+	dialer := &net.Dialer{
+		Timeout:   tc.DialTimeout,
+		KeepAlive: tc.KeepAlive,
+	}
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		TLSClientConfig:       tlsCfg,
+		TLSHandshakeTimeout:   tc.TLSHandshakeTimeout,
+		IdleConnTimeout:       tc.IdleConnTimeout,
+		MaxIdleConns:          tc.MaxIdleConns,
+		MaxIdleConnsPerHost:   tc.MaxIdleConnsPerHost,
+		MaxConnsPerHost:       tc.MaxConnsPerHost,
+		ResponseHeaderTimeout: tc.ResponseHeaderTimeout,
+		ExpectContinueTimeout: tc.ExpectContinueTimeout,
+		DisableCompression:    tc.DisableCompression,
+		ForceAttemptHTTP2:     !tc.DisableHTTP2,
+	}
 }
 
 // HTTPError is returned by Client.Do when the server responds with a
@@ -208,11 +318,21 @@ type Config struct {
 type HTTPError struct {
 	StatusCode int
 	Status     string
+	// Err is the underlying transport error, if any. It is preserved so that
+	// errors.Is / errors.As can traverse through an HTTPError to the root
+	// cause (e.g. context.DeadlineExceeded, *net.OpError).
+	Err error
 }
 
 func (e *HTTPError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("server returned %s: %v", e.Status, e.Err)
+	}
 	return fmt.Sprintf("server returned %s", e.Status)
 }
+
+// Unwrap lets errors.Is / errors.As traverse to the underlying error.
+func (e *HTTPError) Unwrap() error { return e.Err }
 
 // Client is a resilient HTTP client with circuit breaker and retry support.
 type Client struct {
@@ -229,7 +349,10 @@ func New(cfg Config) *Client {
 	}
 	transport := cfg.Transport
 	if transport == nil {
-		transport = http.DefaultTransport
+		// Dedicated transport per Client — isolates connection pools between
+		// clients that talk to different backends, and exposes the handshake
+		// and pool knobs via TransportConfig.
+		transport = newTransport(cfg.TransportConfig, cfg.TLSClientConfig)
 	}
 
 	c := &Client{
@@ -350,8 +473,13 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 			if resp != nil {
 				// Capture the status so the final error message is informative
 				// even when the HTTP round-trip itself succeeded (no transport error).
+				// Preserve the underlying transport error (if any) in HTTPError.Err
+				// so errors.Is / errors.As can still reach the root cause
+				// (context.DeadlineExceeded, *net.OpError, etc.).
 				if lastErr == nil {
 					lastErr = &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status}
+				} else {
+					lastErr = &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Err: lastErr}
 				}
 				// Drain up to 1 MiB before closing so the transport can reuse the
 				// underlying TCP connection. Bodies larger than the cap are not

@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -22,22 +23,22 @@ func newTestStore(t *testing.T) *CacheStore {
 
 func TestNewCacheStore_InvalidConfig(t *testing.T) {
 	_, err := NewCacheStore(CacheConfig{DefaultTTL: 0, CleanupInterval: time.Second, MaxSize: 10, MaxMemoryMB: 1})
-	if err != ErrInvalidTTL {
+	if !errors.Is(err, ErrInvalidTTL) {
 		t.Fatalf("want ErrInvalidTTL, got %v", err)
 	}
 
 	_, err = NewCacheStore(CacheConfig{DefaultTTL: time.Second, CleanupInterval: 0, MaxSize: 10, MaxMemoryMB: 1})
-	if err != ErrInvalidCleanupInterval {
+	if !errors.Is(err, ErrInvalidCleanupInterval) {
 		t.Fatalf("want ErrInvalidCleanupInterval, got %v", err)
 	}
 
 	_, err = NewCacheStore(CacheConfig{DefaultTTL: time.Second, CleanupInterval: time.Second, MaxSize: 0, MaxMemoryMB: 1})
-	if err != ErrInvalidMaxSize {
+	if !errors.Is(err, ErrInvalidMaxSize) {
 		t.Fatalf("want ErrInvalidMaxSize, got %v", err)
 	}
 
 	_, err = NewCacheStore(CacheConfig{DefaultTTL: time.Second, CleanupInterval: time.Second, MaxSize: 10, MaxMemoryMB: 0})
-	if err != ErrInvalidMaxMemory {
+	if !errors.Is(err, ErrInvalidMaxMemory) {
 		t.Fatalf("want ErrInvalidMaxMemory, got %v", err)
 	}
 }
@@ -60,7 +61,7 @@ func TestSetAndGet(t *testing.T) {
 func TestGet_NotFound(t *testing.T) {
 	cs := newTestStore(t)
 	_, err := cs.Get("missing")
-	if err != ErrNotFound {
+	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 }
@@ -73,7 +74,7 @@ func TestGet_Expired(t *testing.T) {
 	}
 	time.Sleep(5 * time.Millisecond)
 	_, err := cs.Get("ex")
-	if err != ErrNotFound {
+	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound for expired key, got %v", err)
 	}
 	stats := cs.GetStats()
@@ -85,7 +86,7 @@ func TestGet_Expired(t *testing.T) {
 func TestSetEmptyKey(t *testing.T) {
 	cs := newTestStore(t)
 	err := cs.Set("", "v", nil)
-	if err != ErrInvalidKey {
+	if !errors.Is(err, ErrInvalidKey) {
 		t.Fatalf("want ErrInvalidKey, got %v", err)
 	}
 }

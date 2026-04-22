@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"net/url"
 	"slices"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jozefvalachovic/server/cache"
+	"github.com/jozefvalachovic/server/internal/singleflight"
 
 	"github.com/jozefvalachovic/logger/v4"
 )
@@ -59,12 +61,59 @@ type HTTPCacheConfig struct {
 	// InvalidateMethods lists HTTP methods whose 2xx responses cause the entire
 	// prefix to be invalidated. Defaults to POST, PUT, PATCH, DELETE.
 	InvalidateMethods []string
+
+	// StaleWhileRevalidate extends the effective lifetime of a cached entry
+	// beyond TTL. Within the stale window the cached body is served
+	// immediately with X-Cache: STALE and a background refresh is dispatched
+	// via singleflight so only one handler invocation runs per key. Zero
+	// disables SWR (entries expire exactly at TTL, as before).
+	//
+	// Tuning: a typical value is 3–10× TTL. Large windows reduce the chance
+	// of a synchronous miss under low traffic but increase the maximum age of
+	// data a client may observe. Do NOT enable SWR on endpoints whose
+	// correctness depends on up-to-the-second data (authoritative reads,
+	// balances, auth scopes).
+	//
+	// Entries are held in the underlying store for TTL + StaleWhileRevalidate
+	// + StaleIfError, so cache memory scales accordingly.
+	StaleWhileRevalidate time.Duration
+
+	// StaleIfError extends the stale window further for the specific purpose
+	// of shielding clients from downstream failures. When a background refresh
+	// (or a fresh miss) returns a non-2xx response and a stale entry is still
+	// within TTL + StaleWhileRevalidate + StaleIfError, the stale body is
+	// served with X-Cache: STALE-ERROR instead of surfacing the error.
+	//
+	// Requires a non-zero TTL. Zero disables the behaviour (errors surface
+	// normally). Callers who enable this should monitor X-Cache: STALE-ERROR
+	// rates — sustained non-zero rates indicate an unhealthy upstream.
+	StaleIfError time.Duration
 }
 
 // defaultInvalidateMethods are the HTTP methods that trigger cache invalidation.
 var defaultInvalidateMethods = []string{
 	http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete,
 }
+
+// cachedResponseHeaderDenylist lists response headers that must never be
+// stored in the cache because they carry per-identity or per-connection state
+// that cannot be safely replayed to a different caller. Keys are in
+// canonical form as produced by http.CanonicalHeaderKey so the match is O(1).
+var cachedResponseHeaderDenylist = map[string]struct{}{
+	"Set-Cookie":          {}, // session tokens
+	"Proxy-Authenticate":  {}, // hop-by-hop
+	"Www-Authenticate":    {}, // challenges are per-request
+	"Authorization":       {}, // defensive: never a response header, but guard anyway
+	"Proxy-Authorization": {}, // defensive: hop-by-hop
+}
+
+// forbiddenPrefixChars are characters that must never appear in a KeyPrefix
+// return value. ':' is the prefix/key separator in the cache store's prefix
+// index — a prefix containing ':' would be bucketed under the wrong prefix
+// and break invalidation. '\n' and '\x00' are rejected defensively so
+// prefixes remain safe to embed in log lines, URLs, or future wire formats
+// (e.g. peer-invalidation requests) without escaping.
+const forbiddenPrefixChars = ":\n\x00"
 
 // cacheResponseRecorder forwards all writes to the underlying ResponseWriter
 // while simultaneously capturing the status code, response headers, and body.
@@ -158,6 +207,90 @@ func (r *cacheResponseRecorder) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// bufferedRecorder captures the handler's response entirely in memory without
+// writing to any real client. It is used by the singleflight-dedup'd miss path
+// so that one handler execution can be replayed to many concurrent callers.
+//
+// Unlike cacheResponseRecorder it implements http.ResponseWriter without an
+// embedded real writer — nothing is forwarded anywhere until the caller
+// explicitly replays the captured snapshot with writeSnapshot.
+type bufferedRecorder struct {
+	headers    http.Header
+	statusCode int
+	body       bytes.Buffer
+	wroteHdr   bool
+	streamed   bool
+}
+
+func newBufferedRecorder() *bufferedRecorder {
+	return &bufferedRecorder{
+		headers:    make(http.Header),
+		statusCode: http.StatusOK,
+	}
+}
+
+func (r *bufferedRecorder) Header() http.Header { return r.headers }
+
+func (r *bufferedRecorder) WriteHeader(code int) {
+	if r.wroteHdr {
+		return
+	}
+	r.wroteHdr = true
+	r.statusCode = code
+}
+
+func (r *bufferedRecorder) Write(b []byte) (int, error) {
+	if !r.wroteHdr {
+		r.WriteHeader(http.StatusOK)
+	}
+	return r.body.Write(b)
+}
+
+// Flush marks the response as streamed so it is not stored in the cache.
+// There is no underlying writer to flush; callers in the singleflight path
+// will still receive the complete buffered body when the handler returns.
+func (r *bufferedRecorder) Flush() { r.streamed = true }
+
+// missSnapshot is the result of a handler execution captured by
+// bufferedRecorder, safe to replay to multiple clients.
+type missSnapshot struct {
+	statusCode int
+	headers    http.Header
+	body       []byte
+	streamed   bool
+}
+
+func snapshotFrom(rec *bufferedRecorder) *missSnapshot {
+	hdrs := make(http.Header, len(rec.headers))
+	for k, vv := range rec.headers {
+		hdrs[k] = slices.Clone(vv)
+	}
+	return &missSnapshot{
+		statusCode: rec.statusCode,
+		headers:    hdrs,
+		body:       bytes.Clone(rec.body.Bytes()),
+		streamed:   rec.streamed,
+	}
+}
+
+// writeSnapshot replays a missSnapshot to a client ResponseWriter, adding the
+// X-Cache: MISS sentinel. Used by both the singleflight leader and followers.
+func (s *missSnapshot) writeSnapshot(w http.ResponseWriter, includeBody bool) {
+	for k, vv := range s.headers {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.Header().Set("X-Cache", "MISS")
+	w.WriteHeader(s.statusCode)
+	if includeBody {
+		if _, werr := w.Write(s.body); werr != nil {
+			logger.LogWarn("HTTPCache: failed to write miss body",
+				"status", s.statusCode, "error", werr.Error())
+		}
+	}
+}
+
 // HTTPCache returns an HTTPMiddleware that adds request/response caching:
 //
 //   - GET / HEAD: served from cache on hit; handler response stored on miss.
@@ -170,7 +303,35 @@ func (r *cacheResponseRecorder) Write(b []byte) (int, error) {
 //   - The client sends Cache-Control: no-store
 //   - The response status is not exactly 200
 //   - The response sets a Set-Cookie header (session tokens must not be shared)
+//   - The response is already content-encoded (Content-Encoding header set)
 //   - The underlying write to the client fails mid-stream
+//
+// # Middleware ordering
+//
+// HTTPCache MUST be placed BEFORE the Compress middleware in the request path
+// (i.e. closer to the client, outer wrap). Otherwise the compressed bytes are
+// what gets stored, and the cache will replay a gzipped body to a client that
+// did not advertise Accept-Encoding: gzip. Correct order (outermost first):
+//
+//	Compress → HTTPCache → handler  // WRONG — caches gzipped bytes
+//	HTTPCache → Compress → handler  // CORRECT — caches identity bytes
+//
+// As a belt-and-braces guard, responses that already carry a Content-Encoding
+// header are never stored.
+//
+// # Vary awareness
+//
+// The default cache key is derived from the KeyPrefix plus the request path
+// and sorted query string. It does NOT automatically vary by request headers
+// (Accept-Language, Accept-Encoding, tenant ID, …). Handlers that produce
+// different representations for the same URL must encode the discriminating
+// header value into KeyPrefix — for example:
+//
+//	KeyPrefix: func(r *http.Request) string {
+//	    uid := middleware.AuthIdentityFromContext(r)
+//	    lang := r.Header.Get("Accept-Language")
+//	    return uid + "_" + lang + "_products"
+//	}
 func HTTPCache(cfg HTTPCacheConfig) func(http.Handler) http.Handler {
 	invalidateMethods := cfg.InvalidateMethods
 	if len(invalidateMethods) == 0 {
@@ -183,16 +344,24 @@ func HTTPCache(cfg HTTPCacheConfig) func(http.Handler) http.Handler {
 
 	// Fail-fast probe: call KeyPrefix with a minimal synthetic request to catch
 	// obviously broken configurations at server startup instead of at the first
-	// real request. We only flag a ':' in the output when the probe returns a
-	// non-empty string; a KeyPrefix that relies on request-specific fields
-	// (headers, host, auth) may legitimately return "" here, and the runtime
-	// guard below will still catch per-request breakage.
+	// real request. We only flag forbidden characters in the output when the
+	// probe returns a non-empty string; a KeyPrefix that relies on request-
+	// specific fields (headers, host, auth) may legitimately return "" here,
+	// and the runtime guard below will still catch per-request breakage.
 	if cfg.Store != nil && cfg.KeyPrefix != nil {
 		probe := &http.Request{Method: http.MethodGet, URL: &url.URL{Path: "/"}, Header: http.Header{}}
-		if pp := cfg.KeyPrefix(probe); pp != "" && strings.ContainsRune(pp, ':') {
-			panic("middleware.HTTPCache: KeyPrefix returned a value containing ':' for a probe request; ':' is reserved as the prefix/key separator and must not appear in KeyPrefix output")
+		if pp := cfg.KeyPrefix(probe); pp != "" && strings.ContainsAny(pp, forbiddenPrefixChars) {
+			panic("middleware.HTTPCache: KeyPrefix returned a value containing a forbidden character (':', newline, or NUL) for a probe request; these characters are reserved and must not appear in KeyPrefix output")
 		}
 	}
+
+	// sf deduplicates concurrent cache misses for the same key. When many
+	// requests hit the same URL simultaneously and the cache is cold (e.g.
+	// immediately after a pod restart), without singleflight every request
+	// would run the handler and stampede the underlying data source. With
+	// singleflight, only one handler invocation runs per key; all other
+	// concurrent requests share its result.
+	sf := &singleflight.Group{}
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -212,13 +381,12 @@ func HTTPCache(cfg HTTPCacheConfig) func(http.Handler) http.Handler {
 				next.ServeHTTP(w, r)
 				return
 			}
-			// A colon in the prefix would break cacheKeyPrefix extraction: the
-			// prefix index buckets keys by the segment before the first ':', so
-			// "tenant:42_products:GET:/..." would be keyed under "tenant" instead
-			// of the intended prefix. Log a warning and bypass rather than
+			// A forbidden character in the prefix would break cacheKeyPrefix
+			// extraction (':' is the separator) or be unsafe to embed in
+			// logs/URLs ('\n', '\x00'). Log a warning and bypass rather than
 			// silently serving wrong (or no) invalidations.
-			if strings.ContainsRune(prefix, ':') {
-				logger.LogWarn("HTTPCache: KeyPrefix contains ':' which breaks prefix isolation; bypassing cache",
+			if strings.ContainsAny(prefix, forbiddenPrefixChars) {
+				logger.LogWarn("HTTPCache: KeyPrefix contains a forbidden character (':', newline, or NUL); bypassing cache",
 					"prefix", prefix)
 				next.ServeHTTP(w, r)
 				return
@@ -241,70 +409,90 @@ func HTTPCache(cfg HTTPCacheConfig) func(http.Handler) http.Handler {
 
 				if val, err := cfg.Store.Get(key); err == nil {
 					if cached, ok := val.(cache.CachedResponse); ok {
-						// Cache HIT — replay all stored headers then the body.
-						for k, vv := range cached.Headers {
-							for _, v := range vv {
-								w.Header().Add(k, v)
-							}
+						now := time.Now()
+						// Fresh window: either FreshUntil is unset (classic
+						// behaviour — entry is fresh until the store evicts it)
+						// or we are before the recorded fresh boundary.
+						fresh := cached.FreshUntil.IsZero() || now.Before(cached.FreshUntil)
+						if fresh {
+							replayCached(w, r, cached, "HIT")
+							return
 						}
-						w.Header().Set("X-Cache", "HIT")
-						w.WriteHeader(cached.StatusCode)
-						if r.Method != http.MethodHead {
-							if _, werr := w.Write(cached.Body); werr != nil {
-								logger.LogWarn("HTTPCache: failed to write cached body",
-									"key", key, "error", werr.Error())
+						// Stale window: entry is past its fresh boundary but
+						// still served from the store. Fire a background
+						// refresh (singleflight-deduped) and serve the stale
+						// body immediately.
+						if cfg.StaleWhileRevalidate > 0 && now.Before(cached.FreshUntil.Add(cfg.StaleWhileRevalidate)) {
+							replayCached(w, r, cached, "STALE")
+							if r.Method == http.MethodGet {
+								go backgroundRefresh(cfg, sf, key, r, next)
 							}
+							return
 						}
-						return
+						// Beyond SWR but within StaleIfError: only used as a
+						// fallback when the foreground refresh fails; fall
+						// through to the miss path.
 					}
 				}
 
-				// Cache MISS — record the handler's response.
-				// HEAD: mark as BYPASS since the response won't be stored
-				// (storing a HEAD response would serve an empty body to GET clients).
-				rec := newCacheResponseRecorder(w)
+				// Cache MISS.
+				//
+				// HEAD is never stored in the cache (HEAD has no body, so storing
+				// it would serve an empty body to subsequent GET clients) and is
+				// also not routed through singleflight — HEADs are cheap and
+				// share no work with GETs.
 				if r.Method == http.MethodHead {
+					rec := newCacheResponseRecorder(w)
 					rec.capturedHeaders.Set("X-Cache", "BYPASS")
-				} else {
+					next.ServeHTTP(rec, r)
+					return
+				}
+
+				// GET miss: singleflight-dedup concurrent identical misses so
+				// that a cold-cache stampede (e.g. right after a pod restart)
+				// results in only one handler execution per key. Followers share
+				// the leader's snapshot.
+				//
+				// The cache Set() happens inside fn so that it is executed by
+				// the leader only — singleflight's returned shared flag applies
+				// to all callers (leader and followers alike) when a call is
+				// deduplicated, so it cannot be used to distinguish the two.
+				result, _, _ := sf.Do(key, func() (any, error) {
+					rec := newBufferedRecorder()
+					next.ServeHTTP(rec, r)
+					snap := snapshotFrom(rec)
+
+					if storeResponse(cfg, key, snap) {
+						return snap, nil
+					}
+					return snap, nil
+				})
+				snap, _ := result.(*missSnapshot)
+				if snap == nil {
+					// Defensive: singleflight didn't yield a snapshot. Fall back
+					// to running the handler against the client writer directly.
+					rec := newCacheResponseRecorder(w)
 					rec.capturedHeaders.Set("X-Cache", "MISS")
+					next.ServeHTTP(rec, r)
+					return
 				}
-				next.ServeHTTP(rec, r)
 
-				// Only populate the cache for GET (never HEAD — HEAD has no body, so
-				// storing it would serve an empty body to subsequent GET requests).
-				// Also skip non-200, write failures, streamed responses, and Set-Cookie.
-				if r.Method == http.MethodGet &&
-					rec.statusCode == http.StatusOK &&
-					!rec.writeFailed &&
-					!rec.streamed &&
-					rec.capturedHeaders.Get("Set-Cookie") == "" {
-
-					var ttl *time.Duration
-					if cfg.TTL > 0 {
-						t := cfg.TTL
-						ttl = &t
-					}
-					// Clone response headers for storage, excluding the per-response
-					// X-Cache sentinel (set fresh as HIT/MISS on every response).
-					hdrs := make(http.Header, len(rec.capturedHeaders))
-					for k, vv := range rec.capturedHeaders {
-						if k == "X-Cache" {
-							continue
+				// StaleIfError: if the handler returned a non-2xx and we still
+				// have a stale entry within TTL+SWR+StaleIfError, replay it
+				// instead of surfacing the error.
+				if cfg.StaleIfError > 0 && !(snap.statusCode >= 200 && snap.statusCode < 300) {
+					if val, err := cfg.Store.Get(key); err == nil {
+						if cached, ok := val.(cache.CachedResponse); ok && !cached.FreshUntil.IsZero() {
+							limit := cached.FreshUntil.Add(cfg.StaleWhileRevalidate).Add(cfg.StaleIfError)
+							if time.Now().Before(limit) {
+								replayCached(w, r, cached, "STALE-ERROR")
+								return
+							}
 						}
-						hdrs[k] = slices.Clone(vv)
-					}
-					entry := cache.CachedResponse{
-						StatusCode: rec.statusCode,
-						Headers:    hdrs,
-						// Copy the bytes out of the buffer's internal array so the
-						// cached slice is fully independent of the recorder's lifetime.
-						Body: bytes.Clone(rec.body.Bytes()),
-					}
-					if serr := cfg.Store.Set(key, entry, ttl); serr != nil {
-						logger.LogWarn("HTTPCache: failed to store response",
-							"key", key, "error", serr.Error())
 					}
 				}
+
+				snap.writeSnapshot(w, true)
 				return
 			}
 
@@ -328,4 +516,118 @@ func HTTPCache(cfg HTTPCacheConfig) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// replayCached writes a CachedResponse to the client ResponseWriter, tagging
+// it with X-Cache: HIT | STALE | STALE-ERROR. HEAD requests receive headers
+// and status only, matching HTTP semantics.
+func replayCached(w http.ResponseWriter, r *http.Request, cached cache.CachedResponse, xCache string) {
+	for k, vv := range cached.Headers {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.Header().Set("X-Cache", xCache)
+	w.WriteHeader(cached.StatusCode)
+	if r.Method != http.MethodHead {
+		if _, werr := w.Write(cached.Body); werr != nil {
+			logger.LogWarn("HTTPCache: failed to write cached body",
+				"status", cached.StatusCode, "xCache", xCache, "error", werr.Error())
+		}
+	}
+}
+
+// storeResponse writes an eligible snapshot to the cache store, applying the
+// Set-Cookie / Content-Encoding / status guards and the response-header
+// denylist. Returns true when the response was stored.
+//
+// When StaleWhileRevalidate or StaleIfError are configured, the store TTL is
+// extended to TTL + SWR + StaleIfError and CachedResponse.FreshUntil marks
+// the end of the fresh window so the middleware can distinguish fresh from
+// stale on retrieval.
+func storeResponse(cfg HTTPCacheConfig, key string, snap *missSnapshot) bool {
+	if snap.statusCode != http.StatusOK ||
+		snap.streamed ||
+		snap.headers.Get("Set-Cookie") != "" ||
+		snap.headers.Get("Content-Encoding") != "" {
+		return false
+	}
+
+	hdrs := make(http.Header, len(snap.headers))
+	for k, vv := range snap.headers {
+		if _, deny := cachedResponseHeaderDenylist[http.CanonicalHeaderKey(k)]; deny {
+			continue
+		}
+		if k == "X-Cache" {
+			continue
+		}
+		hdrs[k] = slices.Clone(vv)
+	}
+
+	entry := cache.CachedResponse{
+		StatusCode: snap.statusCode,
+		Headers:    hdrs,
+		Body:       bytes.Clone(snap.body),
+	}
+
+	var ttl *time.Duration
+	if cfg.TTL > 0 {
+		fresh := cfg.TTL
+		entry.FreshUntil = time.Now().Add(fresh)
+		total := fresh + cfg.StaleWhileRevalidate + cfg.StaleIfError
+		ttl = &total
+	}
+
+	if serr := cfg.Store.Set(key, entry, ttl); serr != nil {
+		logger.LogWarn("HTTPCache: failed to store response",
+			"key", key, "error", serr.Error())
+		return false
+	}
+	return true
+}
+
+// backgroundRefresh revalidates a stale cache entry out-of-band. It detaches
+// the request from the originating client context (so the refresh survives
+// even if the client disconnects) and singleflight-deduplicates concurrent
+// refreshes of the same key. Non-2xx responses are not stored — the previous
+// (stale) entry continues to be served until its hard expiry. Panics inside
+// the handler are recovered and logged.
+func backgroundRefresh(
+	cfg HTTPCacheConfig,
+	sf *singleflight.Group,
+	key string,
+	r *http.Request,
+	next http.Handler,
+) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			logger.LogError("HTTPCache: panic in background refresh",
+				"key", key, "panic", rec)
+		}
+	}()
+
+	// Detach the refresh from the originating request's context so cancellation
+	// of the client-facing request does not abort the refresh mid-flight.
+	// The refresh carries its own deadline derived from the fresh TTL so a
+	// wedged handler cannot leak a goroutine forever.
+	refreshTimeout := cfg.TTL
+	if refreshTimeout <= 0 {
+		refreshTimeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
+	defer cancel()
+
+	cloned := r.Clone(ctx)
+	// Preserve only the URL / method / headers for replay. Body has already
+	// been consumed by the foreground handler (if any) and SWR only applies
+	// to GET so there is nothing to preserve.
+	cloned.Body = http.NoBody
+
+	_, _, _ = sf.Do(key+"|refresh", func() (any, error) {
+		rec := newBufferedRecorder()
+		next.ServeHTTP(rec, cloned)
+		snap := snapshotFrom(rec)
+		storeResponse(cfg, key, snap)
+		return snap, nil
+	})
 }

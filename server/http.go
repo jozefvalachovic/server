@@ -572,6 +572,18 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 	if !cfg.NoWriteTimeout && writeTimeout == 0 {
 		writeTimeout = config.DefaultWriteTimeout
 	}
+	// Advisory: when callers declare streaming routes via TimeoutConfig.SSEPaths
+	// but leave http.Server.WriteTimeout enabled, the outer connection-level
+	// deadline will still cap response duration regardless of the Timeout
+	// middleware skipping the route. Log once at construction so this is loud
+	// in startup logs rather than a mystery 60 s disconnect in production.
+	if cfg.Timeout != nil && len(cfg.Timeout.SSEPaths) > 0 && writeTimeout > 0 {
+		logger.LogWarn(
+			"TimeoutConfig.SSEPaths set while http.Server.WriteTimeout is non-zero — streaming responses will still be capped by WriteTimeout; set HTTPServerConfig.NoWriteTimeout=true or use a separate server for streams",
+			"writeTimeout", writeTimeout.String(),
+			"ssePaths", cfg.Timeout.SSEPaths,
+		)
+	}
 	// ReadHeaderTimeout is applied independently of ReadTimeout so that even
 	// callers who intentionally disable ReadTimeout (e.g. long upload APIs)
 	// still get Slowloris protection unless they explicitly opt out via
@@ -634,6 +646,14 @@ func (as *HTTPServer) Start() error {
 	// connection-limiting semaphore before handing it to http.Server.
 	ln, err := net.Listen("tcp", as.server.Addr)
 	if err != nil {
+		// Clean up the metrics sidecar we just started so it does not leak its
+		// listener when Start() fails before the main listener is bound.
+		if as.metricsServer != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = as.metricsServer.Shutdown(ctx)
+			cancel()
+			as.metricsServer = nil
+		}
 		return fmt.Errorf("failed to bind listener: %w", err)
 	}
 	if as.maxConns > 0 {
