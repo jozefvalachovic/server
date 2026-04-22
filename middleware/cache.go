@@ -480,7 +480,7 @@ func HTTPCache(cfg HTTPCacheConfig) func(http.Handler) http.Handler {
 				// StaleIfError: if the handler returned a non-2xx and we still
 				// have a stale entry within TTL+SWR+StaleIfError, replay it
 				// instead of surfacing the error.
-				if cfg.StaleIfError > 0 && !(snap.statusCode >= 200 && snap.statusCode < 300) {
+				if cfg.StaleIfError > 0 && (snap.statusCode < 200 || snap.statusCode >= 300) {
 					if val, err := cfg.Store.Get(key); err == nil {
 						if cached, ok := val.(cache.CachedResponse); ok && !cached.FreshUntil.IsZero() {
 							limit := cached.FreshUntil.Add(cfg.StaleWhileRevalidate).Add(cfg.StaleIfError)
