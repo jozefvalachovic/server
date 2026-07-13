@@ -52,7 +52,7 @@ func e2eServer(t *testing.T) (baseURL string, cleanup func()) {
 		MaxMemoryMB:     64,
 	}
 
-	store, err := routes.RegisterRoutes(mux, cacheConfig,
+	store, err := routes.RegisterRoutesWithStore(mux, cacheConfig,
 		productRegistrar,
 		utilRegistrar,
 	)

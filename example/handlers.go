@@ -73,10 +73,13 @@ var (
 // ── registrars ────────────────────────────────────────────────────────────────
 
 // productRegistrar registers all /products routes, using cache when available.
-func productRegistrar(mux *http.ServeMux) {
+// It uses the explicit-store registrar signature so the cache store is passed
+// in directly rather than read from process-global state.
+func productRegistrar(mux *http.ServeMux, store *cache.CacheStore) {
 	// GET /products – paginated, cached. POST /products – mutate + invalidates.
-	// The cache store is injected automatically by routes.CachedRouteHandler.
-	mux.HandleFunc("/products", routes.CachedRouteHandler(
+	// The store is threaded through explicitly via CachedRouteHandlerWithStore.
+	mux.HandleFunc("/products", routes.CachedRouteHandlerWithStore(
+		store,
 		routes.Routes{
 			http.MethodGet:  listProducts,
 			http.MethodPost: createProduct,
@@ -102,8 +105,10 @@ func productRegistrar(mux *http.ServeMux) {
 	}))
 }
 
-// utilRegistrar registers miscellaneous demo endpoints.
-func utilRegistrar(mux *http.ServeMux) {
+// utilRegistrar registers miscellaneous demo endpoints. It accepts the store
+// parameter to satisfy the RegisterRouteRegistrarWithStore signature, though it
+// does not use caching itself.
+func utilRegistrar(mux *http.ServeMux, _ *cache.CacheStore) {
 	// /me is protected by Bearer auth; any non-empty token is accepted in this demo.
 	authCfg := middleware.AuthConfig{
 		Scheme: middleware.AuthSchemeBearer,

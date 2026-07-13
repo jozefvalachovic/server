@@ -152,6 +152,51 @@ func TestCORSHeaders_DefaultWildcard(t *testing.T) {
 	}
 }
 
+// TestDisableCORS_NoHeaders asserts that when DisableCORS is true the MCP
+// handler emits no Access-Control-* headers on any method, so an outer
+// middleware.CORS layer can be the single owner of CORS.
+func TestDisableCORS_NoHeaders(t *testing.T) {
+	h := Handler(Config{
+		Name:           "cors-off",
+		AllowedOrigins: []string{"https://example.com"}, // must be ignored
+		DisableCORS:    true,
+	})
+
+	assertNoCORS := func(t *testing.T, rec *httptest.ResponseRecorder) {
+		t.Helper()
+		for _, hdr := range []string{
+			"Access-Control-Allow-Origin",
+			"Access-Control-Allow-Methods",
+			"Access-Control-Allow-Headers",
+		} {
+			if v := rec.Header().Get(hdr); v != "" {
+				t.Fatalf("DisableCORS=true but %s set to %q", hdr, v)
+			}
+		}
+	}
+
+	// OPTIONS pre-flight — still short-circuits with 204 but writes no CORS.
+	optReq := httptest.NewRequest(http.MethodOptions, "/mcp", nil)
+	optReq.Header.Set("Origin", "https://example.com")
+	optRec := httptest.NewRecorder()
+	h.ServeHTTP(optRec, optReq)
+	if optRec.Code != http.StatusNoContent {
+		t.Fatalf("OPTIONS: want 204, got %d", optRec.Code)
+	}
+	assertNoCORS(t, optRec)
+
+	// GET capability document.
+	getReq := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+	getReq.Header.Set("Origin", "https://example.com")
+	getRec := httptest.NewRecorder()
+	h.ServeHTTP(getRec, getReq)
+	assertNoCORS(t, getRec)
+
+	// POST (initialize) — the real JSON-RPC path.
+	postRec := rpcCall(t, h, "initialize", 1, nil)
+	assertNoCORS(t, postRec)
+}
+
 func TestGetCapability(t *testing.T) {
 	h := newTestHandler()
 	req := httptest.NewRequest(http.MethodGet, "/mcp", nil)

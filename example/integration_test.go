@@ -35,7 +35,7 @@ func setupIntegrationServer(t *testing.T) *httptest.Server {
 		MaxMemoryMB:     64,
 	}
 
-	store, err := routes.RegisterRoutes(mux, cacheConfig,
+	store, err := routes.RegisterRoutesWithStore(mux, cacheConfig,
 		productRegistrar,
 		utilRegistrar,
 	)

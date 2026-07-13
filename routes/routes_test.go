@@ -384,6 +384,7 @@ func TestCachedRouteHandler_DispatchesGETMethod(t *testing.T) {
 	activeStore = newRoutesTestStore(t)
 	called := false
 
+	//nolint:staticcheck // intentionally exercising the deprecated global-store path
 	h := CachedRouteHandler(Routes{
 		http.MethodGet: func(w http.ResponseWriter, r *http.Request) {
 			called = true
@@ -409,6 +410,7 @@ func TestCachedRouteHandler_CachesGETResponse(t *testing.T) {
 	activeStore = newRoutesTestStore(t)
 	handlerCalls := 0
 
+	//nolint:staticcheck // intentionally exercising the deprecated global-store path
 	h := CachedRouteHandler(Routes{
 		http.MethodGet: func(w http.ResponseWriter, r *http.Request) {
 			handlerCalls++
@@ -440,6 +442,7 @@ func TestCachedRouteHandler_CachesGETResponse(t *testing.T) {
 func TestCachedRouteHandler_Returns405ForUnregisteredMethod(t *testing.T) {
 	activeStore = newRoutesTestStore(t)
 
+	//nolint:staticcheck // intentionally exercising the deprecated global-store path
 	h := CachedRouteHandler(Routes{
 		http.MethodGet: func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)

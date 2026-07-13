@@ -2,6 +2,8 @@ package cache
 
 import (
 	"errors"
+	"hash/maphash"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -190,5 +192,104 @@ func TestCleanupExpired(t *testing.T) {
 	cs.cleanupExpired()
 	if cs.GetStats().Size != 1 {
 		t.Fatalf("want 1 remaining entry, got %d", cs.GetStats().Size)
+	}
+}
+
+// keyForShard returns a key that hashes to shard index target for cs. It is a
+// white-box helper (same package) used to construct deliberately shard-skewed
+// workloads for the byte-limit eviction tests below.
+func keyForShard(t *testing.T, cs *CacheStore, prefix string, target uint64) string {
+	t.Helper()
+	for i := range 100_000 {
+		k := prefix + ":" + strconv.Itoa(i)
+		if &cs.shards[hashKeyToShard(cs, k)] == &cs.shards[target] {
+			return k
+		}
+	}
+	t.Fatalf("could not find a key hashing to shard %d", target)
+	return ""
+}
+
+// hashKeyToShard mirrors CacheStore.shardFor's index computation so tests can
+// assert which shard a key lands on without exporting internals.
+func hashKeyToShard(cs *CacheStore, key string) uint64 {
+	return maphash.Bytes(cs.seed, []byte(key)) % cacheShards
+}
+
+// TestSet_ByteLimit_CrossShardEviction verifies that when the incoming key
+// hashes to a shard with nothing to evict, Set reclaims bytes from other
+// shards instead of wrongly returning ErrEntryTooLarge. Regression test for
+// the byte-limit eviction only walking the current shard.
+func TestSet_ByteLimit_CrossShardEviction(t *testing.T) {
+	// 1 MiB budget. Large values so a handful fill the budget.
+	cs, err := NewCacheStore(CacheConfig{
+		MaxSize:         1_000_000, // effectively unlimited entry count
+		DefaultTTL:      time.Minute,
+		CleanupInterval: time.Hour,
+		MaxMemoryMB:     1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cs.Stop)
+
+	// Pick a target shard for the final insert, then fill *other* shards with
+	// large values so the budget is nearly exhausted while the target shard
+	// stays empty.
+	const targetShard = 0
+	big := make([]byte, 200*1024) // 200 KiB each → ~5 fill the 1 MiB budget
+	filled := 0
+	for i := range 100_000 {
+		k := "fill:" + strconv.Itoa(i)
+		if hashKeyToShard(cs, k) == targetShard {
+			continue // keep the target shard empty
+		}
+		if err := cs.Set(k, big, nil); err != nil {
+			// Budget reached; stop filling.
+			break
+		}
+		filled++
+		if cs.GetStats().BytesUsed > 800*1024 {
+			break
+		}
+	}
+	if filled == 0 {
+		t.Fatal("failed to pre-fill other shards")
+	}
+
+	// This key hashes to the empty target shard. With the old single-shard
+	// eviction it would return ErrEntryTooLarge; with cross-shard fallback it
+	// must succeed by evicting from the populated shards.
+	targetKey := keyForShard(t, cs, "target", targetShard)
+	if err := cs.Set(targetKey, big, nil); err != nil {
+		t.Fatalf("Set on empty target shard should succeed via cross-shard eviction, got %v", err)
+	}
+	if _, err := cs.Get(targetKey); err != nil {
+		t.Fatalf("target key should be present after Set, got %v", err)
+	}
+	// Budget must still be respected.
+	if used, limit := cs.GetStats().BytesUsed, int64(1)*1024*1024; used > limit {
+		t.Fatalf("bytesUsed %d exceeds limit %d", used, limit)
+	}
+}
+
+// TestSet_OversizedEntry_StillRejected confirms that a single entry larger
+// than the entire MaxMemoryMB budget is still rejected with ErrEntryTooLarge
+// even after the cross-shard eviction fallback.
+func TestSet_OversizedEntry_StillRejected(t *testing.T) {
+	cs, err := NewCacheStore(CacheConfig{
+		MaxSize:         1_000,
+		DefaultTTL:      time.Minute,
+		CleanupInterval: time.Hour,
+		MaxMemoryMB:     1, // 1 MiB budget
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cs.Stop)
+
+	huge := make([]byte, 2*1024*1024) // 2 MiB > 1 MiB budget
+	if err := cs.Set("huge", huge, nil); !errors.Is(err, ErrEntryTooLarge) {
+		t.Fatalf("want ErrEntryTooLarge for oversized entry, got %v", err)
 	}
 }

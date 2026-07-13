@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -339,6 +340,59 @@ func TestBackoffDuration_Bounds(t *testing.T) {
 		if d > c.retry.MaxBackoff {
 			t.Fatalf("attempt %d: backoff %v exceeds MaxBackoff %v", attempt, d, c.retry.MaxBackoff)
 		}
+	}
+}
+
+// TestBackoffDuration_EqualJitterFloor asserts the equal-jitter strategy keeps
+// each delay within [base*(1-frac), base] and never collapses toward zero.
+func TestBackoffDuration_EqualJitterFloor(t *testing.T) {
+	c := New(Config{
+		Retry: &RetryConfig{
+			MaxRetries:     5,
+			InitialBackoff: 100 * time.Millisecond,
+			MaxBackoff:     10 * time.Second, // high so it never clamps here
+			Multiplier:     2.0,
+			JitterFraction: 0.2,
+		},
+	})
+
+	for attempt := 1; attempt <= 5; attempt++ {
+		base := float64(c.retry.InitialBackoff) * math.Pow(c.retry.Multiplier, float64(attempt-1))
+		floor := time.Duration(base * (1 - c.retry.JitterFraction))
+		ceil := time.Duration(base)
+		// Sample repeatedly since jitter is random.
+		for range 200 {
+			d := c.backoffDuration(attempt)
+			if d < floor-time.Millisecond || d > ceil+time.Millisecond {
+				t.Fatalf("attempt %d: backoff %v outside equal-jitter band [%v, %v]", attempt, d, floor, ceil)
+			}
+		}
+	}
+}
+
+// TestNew_MultiplierClamped verifies a Multiplier below 1 is clamped up to the
+// default 2.0 so backoff never shrinks across attempts.
+func TestNew_MultiplierClamped(t *testing.T) {
+	c := New(Config{
+		Retry: &RetryConfig{
+			MaxRetries:     3,
+			InitialBackoff: 100 * time.Millisecond,
+			MaxBackoff:     10 * time.Second,
+			Multiplier:     0.5, // invalid — would shrink backoff
+			JitterFraction: 0.0, // no jitter so the comparison is exact
+		},
+	})
+	if c.retry.Multiplier != 2.0 {
+		t.Fatalf("Multiplier not clamped: got %v, want 2.0", c.retry.Multiplier)
+	}
+	// With no jitter, backoff must be strictly increasing across attempts.
+	prev := c.backoffDuration(1)
+	for attempt := 2; attempt <= 3; attempt++ {
+		d := c.backoffDuration(attempt)
+		if d <= prev {
+			t.Fatalf("attempt %d: backoff %v did not increase past %v", attempt, d, prev)
+		}
+		prev = d
 	}
 }
 

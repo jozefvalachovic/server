@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jozefvalachovic/server/cache"
 	"github.com/jozefvalachovic/server/middleware"
 	"github.com/jozefvalachovic/server/routes"
 )
@@ -222,8 +223,9 @@ func buildCachedListHandler(b *testing.B) http.Handler {
 		MaxSize:         300,
 		MaxMemoryMB:     128,
 	}
-	store, err := routes.RegisterRoutes(mux, cfg, func(m *http.ServeMux) {
-		m.HandleFunc("/products", routes.CachedRouteHandler(
+	store, err := routes.RegisterRoutesWithStore(mux, cfg, func(m *http.ServeMux, s *cache.CacheStore) {
+		m.HandleFunc("/products", routes.CachedRouteHandlerWithStore(
+			s,
 			routes.Routes{http.MethodGet: listProducts},
 			middleware.HTTPCacheConfig{
 				KeyPrefix: func(r *http.Request) string {

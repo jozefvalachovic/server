@@ -65,7 +65,7 @@ func main() {
 		MaxMemoryMB:     128,
 	}
 
-	store, err := routes.RegisterRoutes(mux, cacheConfig,
+	store, err := routes.RegisterRoutesWithStore(mux, cacheConfig,
 		productRegistrar, // /products  + /products/{id}
 		utilRegistrar,    // /me, /admin, /ip, /validate-email, /cache-demo
 	)

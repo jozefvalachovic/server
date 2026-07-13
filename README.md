@@ -62,9 +62,9 @@ func main() {
     watch.Init() // hot-reload when DEV=1
 
     mux := http.NewServeMux()
-    store, _ := routes.RegisterRoutes(mux, &cache.CacheConfig{
+    store, _ := routes.RegisterRoutesWithStore(mux, &cache.CacheConfig{
         MaxSize: 1000, MaxMemoryMB: 256, DefaultTTL: 5 * time.Minute, CleanupInterval: time.Minute,
-    }, func(mux *http.ServeMux) {
+    }, func(mux *http.ServeMux, store *cache.CacheStore) {
         mux.HandleFunc("GET /ping", func(w http.ResponseWriter, r *http.Request) {
             response.APIResponseWriter(w, "pong", http.StatusOK)
         })
@@ -575,8 +575,17 @@ middleware.Timeout(middleware.TimeoutConfig{
 | `ErrorMessage` | `string`        | "Request timed out. Please try again." | Message in the 504 response body                           |
 | `SkipPaths`    | `[]string`      | none                                   | Exact or prefix paths (trailing `/`) exempt from timeout   |
 | `SSEPaths`     | `[]string`      | none                                   | Convenience for streaming routes; merged into `SkipPaths`  |
+| `WarnOnLeakAfter` | `time.Duration` | 0 (disabled)                        | If > 0, log a warning when a timed-out handler is still running after this grace window |
 
 When the deadline fires, a 504 response is written and `r.Context()` is cancelled. If the handler already committed a response, no 504 is injected. Panics inside the timeout goroutine are recovered.
+
+> **Leaked-goroutine caveat:** cancelling the context does **not** forcibly stop
+> the handler goroutine (Go has no safe preemption). A handler that ignores
+> `r.Context().Done()` (e.g. a synchronous `db.Query` instead of `db.QueryContext`)
+> keeps running after the client received the 504. Every timeout increments an
+> internal counter and logs a warning; set `WarnOnLeakAfter` to additionally
+> detect handlers still running well past the deadline. Read the counters via
+> `middleware.TimeoutMetrics()`.
 
 > **SSE / long-poll note:** List SSE or streaming endpoint paths in `SSEPaths`
 > (or `SkipPaths`) to exempt them from the per-request deadline. Streams are
@@ -673,8 +682,10 @@ GET, HEAD, and OPTIONS requests skip size limiting.
 Helper functions for registering routes on `http.ServeMux`.
 
 ```go
-// Register routes with automatic cache store creation
-store, err := routes.RegisterRoutes(mux, &cache.CacheConfig{...}, registrarA, registrarB)
+// Register routes with automatic cache store creation. Registrars receive the
+// created *cache.CacheStore so they can build cached handlers without relying
+// on any package-global state (safe for parallel tests and multi-store setups).
+store, err := routes.RegisterRoutesWithStore(mux, &cache.CacheConfig{...}, registrarA, registrarB)
 
 // Method routing with 405 Method Not Allowed + Allow header
 mux.HandleFunc("/products", routes.RouteHandler(routes.Routes{
@@ -682,11 +693,13 @@ mux.HandleFunc("/products", routes.RouteHandler(routes.Routes{
     "POST": createProduct,
 }))
 
-// Cached route handler (uses store from RegisterRoutes automatically)
-mux.HandleFunc("/products", routes.CachedRouteHandler(routes.Routes{
-    "GET":  listProducts,
-    "POST": createProduct,
-}, middleware.HTTPCacheConfig{TTL: 5 * time.Minute, KeyPrefix: keyFn}))
+// Cached route handler — pass the store received by the registrar explicitly.
+func productRegistrar(mux *http.ServeMux, store *cache.CacheStore) {
+    mux.HandleFunc("/products", routes.CachedRouteHandlerWithStore(store, routes.Routes{
+        "GET":  listProducts,
+        "POST": createProduct,
+    }, middleware.HTTPCacheConfig{TTL: 5 * time.Minute, KeyPrefix: keyFn}))
+}
 
 // Per-route middleware
 routes.RegisterRoute(mux, routes.Route{
@@ -709,7 +722,15 @@ routes.RegisterSwagger(mux, "/docs", swagger.Config{...})
 routes.RegisterMCP(mux, "/mcp", mcp.Config{...})
 ```
 
-`CachedRouteHandler` injects the store from `RegisterRoutes` automatically — registrars never need to receive or forward the `*cache.CacheStore` pointer.
+`RegisterRoutesWithStore` passes the created `*cache.CacheStore` to each
+registrar, and `CachedRouteHandlerWithStore` takes that store explicitly. This
+uses no package-global state, so it is safe for parallel tests and processes
+that build more than one mux tree or cache store.
+
+> **Deprecated:** the older `routes.RegisterRoutes` + `routes.CachedRouteHandler`
+> pair relied on a process-global active store. It still works (one mux per
+> process) but is unsafe with multiple concurrent stores and will be removed in
+> v2 — prefer `RegisterRoutesWithStore` + `CachedRouteHandlerWithStore`.
 
 ---
 
@@ -1021,13 +1042,19 @@ if errors.Is(err, client.ErrCircuitOpen) {
 }
 ```
 
-**Retry backoff formula:**
+**Retry backoff formula (equal jitter):**
 
 ```
-backoff = InitialBackoff × Multiplier^(attempt-1) ± JitterFraction
+base   = InitialBackoff × Multiplier^(attempt-1)
+backoff = base × (1 − JitterFraction) + rand[0, base × JitterFraction)
 ```
 
-Capped at `MaxBackoff`. Defaults: `Multiplier=2.0`, `JitterFraction=0.2` (±20%), `MaxBackoff=10s`.
+Equal jitter keeps a fixed floor of `base × (1 − JitterFraction)` and adds a
+uniform random component, so the delay stays in `[base × (1 − frac), base]` and
+never collapses toward an immediate retry. Capped at `MaxBackoff`. Defaults:
+`Multiplier=2.0`, `JitterFraction=0.2` (delay in `[0.8·base, base]`),
+`MaxBackoff=10s`. A `Multiplier` below 1 is clamped up to 2.0 so backoff never
+shrinks across attempts.
 
 **Circuit breaker states:**
 
@@ -1105,8 +1132,15 @@ routes.RegisterMCP(mux, "/mcp", mcp.Config{
 | `Tools`          | `[]mcp.Tool`                | none           | Tools the agent may discover and call                       |
 | `AllowedOrigins` | `[]string`                  | `["*"]`        | Restricts the `Access-Control-Allow-Origin` header          |
 | `AuthFunc`       | `func(*http.Request) error` | nil (disabled) | Called before every POST; return non-nil to reject with 401 |
+| `DisableCORS`    | `bool`                      | false          | Turn off all CORS header management inside the handler      |
 
 POST request bodies are capped at **1 MiB** (`http.MaxBytesReader`) to prevent unbounded memory consumption from malicious or misconfigured agents.
+
+> **CORS:** the MCP handler manages its own CORS headers. If the endpoint also
+> sits behind the server-wide `middleware.CORS` layer, both would write
+> `Access-Control-*` headers, producing duplicated/conflicting values that
+> browsers reject. Set `DisableCORS: true` to let the outer middleware own CORS,
+> or align `AllowedOrigins` in both layers.
 
 Input schemas are reflected automatically from the `Input` struct's fields and JSON tags.
 

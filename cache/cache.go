@@ -230,14 +230,28 @@ func (cs *CacheStore) Set(key string, value any, customTtl *time.Duration) error
 	entryBytes := estimateBytes(key, value)
 
 	// ── Enforce byte-level memory limit before insert ────────────────────
+	// The byte budget is store-wide (cs.bytesUsed spans all shards), so — like
+	// the entry-count loop above — eviction must be able to fall back to other
+	// shards. Evicting only from the current shard would let a key hashing to a
+	// near-empty shard be rejected with ErrEntryTooLarge even though other
+	// shards hold plenty of evictable bytes.
 	memLimit := int64(cs.config.MaxMemoryMB) * 1024 * 1024
-	for cs.bytesUsed.Load()+entryBytes > memLimit && len(s.data) > 0 {
-		if len(s.evictQ) == 0 {
-			break // defensive: heap empty — avoid infinite loop
+	for cs.bytesUsed.Load()+entryBytes > memLimit {
+		if len(s.evictQ) > 0 {
+			cs.evictOldestFromShardLocked(s)
+			continue
 		}
-		cs.evictOldestFromShardLocked(s)
+		// Current shard exhausted — reclaim from other shards. evictFromOtherShard
+		// uses TryLock, so it is safe to call while holding s.mu, but it skips
+		// shards that are momentarily contended. That means a rare false
+		// ErrEntryTooLarge is still possible under heavy concurrent write load;
+		// the periodic cleanupLoop → trimToMemoryLimit reconciles the budget.
+		if !cs.evictFromOtherShard(s) {
+			break // genuinely nothing left to evict anywhere
+		}
 	}
-	// If the entry alone exceeds the budget, reject immediately.
+	// If the entry still does not fit after exhausting every shard, it is
+	// larger than the whole budget allows — reject it.
 	if cs.bytesUsed.Load()+entryBytes > memLimit {
 		return ErrEntryTooLarge
 	}
@@ -739,8 +753,12 @@ var (
 	ErrInvalidMaxSize = errors.New("invalid MaxSize: must be greater than zero")
 	// ErrInvalidMaxMemory is returned by Validate when MaxMemoryMB is non-positive.
 	ErrInvalidMaxMemory = errors.New("invalid MaxMemoryMB: must be greater than zero")
-	// ErrEntryTooLarge is returned by Set when the single entry exceeds the
-	// configured MaxMemoryMB budget and is therefore evicted immediately.
+	// ErrEntryTooLarge is returned by Set when a single entry does not fit
+	// within the configured MaxMemoryMB budget even after evicting the oldest
+	// entries across all shards. Under heavy concurrent write load a shard may
+	// be momentarily uncontendable (eviction uses TryLock), so this error can
+	// occasionally surface for an entry that would otherwise fit; the periodic
+	// cleanup loop reconciles the byte budget shortly afterwards.
 	ErrEntryTooLarge = errors.New("entry exceeds MaxMemoryMB limit and was evicted immediately")
 	// ErrNotFound is returned by Get when the key is absent or has expired.
 	ErrNotFound = errors.New("key not found in cache")

@@ -9,6 +9,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -26,11 +27,37 @@ const (
 	authRedirParam = "next"
 )
 
-// trustXFP is set by Register() during admin bootstrap to indicate whether
+// trustXFP is set once by Register() during admin bootstrap to indicate whether
 // X-Forwarded-Proto from the incoming request should be consulted when
 // deciding if the session/CSRF cookies must be marked Secure. Default false
 // (safe fallback: only r.TLS is trusted).
-var trustXFP bool
+//
+// The admin UI is a single-registration singleton (one admin surface per
+// process), so this package-level value is written exactly once via
+// setRegistrationConfig. registerOnce guards that invariant and, on a second
+// conflicting Register call, emits a warning and keeps the first-caller value —
+// mirroring the logger's once-only initialisation pattern.
+var (
+	trustXFP     bool
+	registerOnce sync.Once
+	firstTrust   bool
+)
+
+// setRegistrationConfig records the admin registration config exactly once.
+// Subsequent calls are ignored; a conflicting value is reported to stderr so
+// an accidental second Register() (e.g. two servers in one process) is visible
+// rather than silently changing global cookie behaviour mid-flight.
+func setRegistrationConfig(trust bool) {
+	registerOnce.Do(func() {
+		firstTrust = trust
+		trustXFP = trust
+	})
+	if trust != firstTrust {
+		fmt.Fprintf(os.Stderr,
+			"WARNING: admin.Register called again with TrustXForwardedProto=%v but the first registration used %v; the first value is kept (admin is a single-registration singleton)\n",
+			trust, firstTrust)
+	}
+}
 
 // isSecureRequest reports whether the cookie Secure flag should be set.
 // When trustXFP is true the X-Forwarded-Proto header is honoured, intended

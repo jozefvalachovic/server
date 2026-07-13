@@ -104,6 +104,14 @@ type Config struct {
 	// Return a non-nil error to reject the request with 401 Unauthorized.
 	// nil disables authentication (default).
 	AuthFunc func(r *http.Request) error
+	// DisableCORS turns off all CORS header management inside the MCP handler,
+	// including the OPTIONS pre-flight short-circuit. Set this to true when the
+	// endpoint is mounted behind the server-wide middleware.CORS layer so that
+	// exactly one layer owns the Access-Control-* headers; otherwise both layers
+	// write them, producing duplicated or conflicting values that browsers
+	// reject. When true, AllowedOrigins is ignored and the outer CORS middleware
+	// (or none) is fully responsible for CORS. Default: false.
+	DisableCORS bool
 }
 
 // Handler returns an http.Handler that implements the MCP Streamable HTTP
@@ -290,12 +298,16 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodOptions:
-		setCORSHeaders(w, origin)
+		if !s.cfg.DisableCORS {
+			setCORSHeaders(w, origin)
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	case http.MethodGet:
 		// Some clients ping the endpoint; return a minimal capability document.
-		setCORSHeaders(w, origin)
+		if !s.cfg.DisableCORS {
+			setCORSHeaders(w, origin)
+		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_, _ = w.Write(s.capabilityJSON)
 		return
@@ -306,7 +318,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	setCORSHeaders(w, origin)
+	if !s.cfg.DisableCORS {
+		setCORSHeaders(w, origin)
+	}
 
 	if s.cfg.AuthFunc != nil {
 		if err := s.cfg.AuthFunc(r); err != nil {

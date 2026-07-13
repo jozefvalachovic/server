@@ -5,7 +5,7 @@
 //	import "github.com/jozefvalachovic/server/server"     // HTTP, TCP and metrics servers
 //	import "github.com/jozefvalachovic/server/routes"     // route registration and RouteHandler
 //	import "github.com/jozefvalachovic/server/response"   // JSON response writers and models
-//	import "github.com/jozefvalachovic/server/middleware"  // HTTPCache for CachedRouteHandler; per-route middleware
+//	import "github.com/jozefvalachovic/server/middleware"  // HTTPCache for CachedRouteHandlerWithStore; per-route middleware
 //	import "github.com/jozefvalachovic/server/client"     // optional — Client, ClientConfig etc. re-exported from server
 //	import "github.com/jozefvalachovic/server/request"    // GetIPAddress, ValidateEmail, SanitizeEmail …
 //	import "github.com/jozefvalachovic/server/swagger"    // embedded Swagger UI
@@ -32,8 +32,8 @@
 //
 //	mux := http.NewServeMux()
 //
-//	store, err := routes.RegisterRoutes(mux, nil,
-//	    func(mux *http.ServeMux) {
+//	store, err := routes.RegisterRoutesWithStore(mux, nil,
+//	    func(mux *http.ServeMux, store *cache.CacheStore) {
 //	        routes.RegisterRouteList(mux, []routes.Route{
 //	            {Method: http.MethodGet,  Path: "/organisations", Handler: listOrgs},
 //	            {Method: http.MethodPost, Path: "/organisations", Handler: createOrg},

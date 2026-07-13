@@ -50,6 +50,13 @@ var (
 // CachedRouteHandler inside a registrar to add caching without handling stores.
 type RegisterRouteRegistrar func(mux *http.ServeMux)
 
+// RegisterRouteRegistrarWithStore is like RegisterRouteRegistrar but also
+// receives the *cache.CacheStore created for this RegisterRoutes call. Use it
+// together with CachedRouteHandlerWithStore to build cached handlers without
+// relying on the package-global active store — the preferred approach for
+// tests and any process that constructs more than one mux tree or cache store.
+type RegisterRouteRegistrarWithStore func(mux *http.ServeMux, store *cache.CacheStore)
+
 // RegisterRoutes registers route groups to the main router.
 // When cacheConfig is non-nil a dedicated CacheStore is created and managed
 // internally; call store.Stop() on the returned value during graceful shutdown.
@@ -79,13 +86,80 @@ func RegisterRoutes(mux *http.ServeMux, cacheConfig *cache.CacheConfig,
 	return activeStore, nil
 }
 
+// RegisterRoutesWithStore is the explicit-store form of RegisterRoutes. It
+// creates and returns a dedicated CacheStore (when cacheConfig is non-nil) and
+// passes it to each registrar, so registrars can build cached handlers via
+// CachedRouteHandlerWithStore without touching any package-global state.
+//
+// Prefer this over RegisterRoutes in tests and in any process that constructs
+// more than one mux tree or cache store concurrently. Unlike RegisterRoutes it
+// does not set (or read) the package-global active store, so multiple
+// independent trees are fully isolated.
+//
+// Call store.Stop() on the returned value during graceful shutdown. Returns
+// nil when cacheConfig is nil, or an error if cacheConfig is invalid.
+func RegisterRoutesWithStore(mux *http.ServeMux, cacheConfig *cache.CacheConfig,
+	registrars ...RegisterRouteRegistrarWithStore,
+) (*cache.CacheStore, error) {
+	var store *cache.CacheStore
+	if cacheConfig != nil {
+		s, err := cache.NewCacheStore(*cacheConfig)
+		if err != nil {
+			return nil, err
+		}
+		store = s
+	}
+	for _, register := range registrars {
+		register(mux, store)
+	}
+	return store, nil
+}
+
 // CachedRouteHandler wraps RouteHandler(routes) with the HTTPCache middleware.
 // The store configured in RegisterRoutes is injected automatically — no need
 // to pass *cache.CacheStore through your registrar.
+//
+// Deprecated: CachedRouteHandler depends on the process-global active store set
+// by RegisterRoutes, which is unsafe when more than one cache store exists in a
+// process (e.g. parallel tests) and silently caches nothing if no store is
+// active. Use RegisterRoutesWithStore + CachedRouteHandlerWithStore instead.
+// This function will be removed in v2.
 func CachedRouteHandler(routes Routes, cfg middleware.HTTPCacheConfig) http.HandlerFunc {
-	// The caller is expected to invoke CachedRouteHandler inside a registrar
-	// passed to RegisterRoutes, which already holds activeStoreMu.
-	cfg.Store = activeStore
+	// Read activeStore WITHOUT taking activeStoreMu. CachedRouteHandler is
+	// contractually invoked synchronously inside a RegisterRouteRegistrar,
+	// which runs while RegisterRoutes already holds activeStoreMu for writing.
+	// Go's sync.RWMutex is not reentrant, so acquiring RLock here on the same
+	// goroutine would self-deadlock. The write lock held by RegisterRoutes
+	// already provides the necessary happens-before guarantee for this read.
+	store := activeStore
+	if store == nil {
+		// Caching was requested but no store is active — make this loud at
+		// registration time instead of silently serving uncached forever.
+		logger.LogWarn("routes.CachedRouteHandler: no active cache store; responses will NOT be cached (did you call RegisterRoutes with a non-nil cacheConfig, or should you use CachedRouteHandlerWithStore?)")
+	}
+	// Guard against the typed-nil interface trap: only assign a real store so
+	// HTTPCache's `cfg.Store == nil` passthrough check works when store is nil.
+	if store != nil {
+		cfg.Store = store
+	}
+	return middleware.HTTPCache(cfg)(RouteHandler(routes)).ServeHTTP
+}
+
+// CachedRouteHandlerWithStore is the explicit-store form of CachedRouteHandler.
+// The store is passed in directly (typically the one received by a
+// RegisterRouteRegistrarWithStore), so no package-global state is read. Prefer
+// this in tests and multi-store processes.
+//
+// When store is nil the middleware is a passthrough (no caching), matching the
+// behaviour of a nil Store in middleware.HTTPCacheConfig.
+func CachedRouteHandlerWithStore(store *cache.CacheStore, routes Routes, cfg middleware.HTTPCacheConfig) http.HandlerFunc {
+	// Only assign when non-nil. Assigning a typed-nil *cache.CacheStore to the
+	// CacheBackend interface would produce a non-nil interface wrapping a nil
+	// pointer, defeating HTTPCache's `cfg.Store == nil` passthrough check and
+	// causing a nil-pointer panic on the first request.
+	if store != nil {
+		cfg.Store = store
+	}
 	return middleware.HTTPCache(cfg)(RouteHandler(routes)).ServeHTTP
 }
 
@@ -123,6 +197,14 @@ func RegisterSwagger(mux *http.ServeMux, path string, cfg swagger.Config) {
 // RegisterMCP mounts an MCP (Model Context Protocol) tool server at the given
 // path (e.g. "/mcp"). Agents discover and call tools via JSON-RPC 2.0 POST
 // requests to that endpoint following the MCP 2024-11-05 specification.
+//
+// CORS: mcp.Handler manages its own CORS headers. If the server-wide
+// middleware.CORS layer is also enabled (the default when
+// HTTPServerConfig.CORS is set), both layers would write Access-Control-*
+// headers for this path, producing duplicated or conflicting values that
+// browsers reject. To avoid this, either set mcp.Config.DisableCORS = true
+// (letting the outer middleware own CORS) or align AllowedOrigins in both
+// layers. Prefer DisableCORS when the endpoint sits behind the shared stack.
 func RegisterMCP(mux *http.ServeMux, path string, cfg mcp.Config) {
 	path = strings.TrimRight(path, "/")
 	mux.Handle(path, mcp.Handler(cfg))

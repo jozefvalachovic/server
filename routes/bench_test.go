@@ -92,10 +92,10 @@ func BenchmarkRegisterRouteList(b *testing.B) {
 
 func BenchmarkCachedRouteHandler_Hit(b *testing.B) {
 	store := newBenchStore(b)
-	h := CachedRouteHandler(
+	h := CachedRouteHandlerWithStore(
+		store,
 		Routes{http.MethodGet: benchOKHandler.ServeHTTP},
 		middleware.HTTPCacheConfig{
-			Store:     store,
 			KeyPrefix: func(_ *http.Request) string { return "bench-routes-hit" },
 		},
 	)
@@ -113,10 +113,10 @@ func BenchmarkCachedRouteHandler_Hit(b *testing.B) {
 
 func BenchmarkCachedRouteHandler_Miss(b *testing.B) {
 	store := newBenchStore(b)
-	h := CachedRouteHandler(
+	h := CachedRouteHandlerWithStore(
+		store,
 		Routes{http.MethodGet: benchOKHandler.ServeHTTP},
 		middleware.HTTPCacheConfig{
-			Store:     store,
 			KeyPrefix: func(r *http.Request) string { return r.URL.Path },
 		},
 	)

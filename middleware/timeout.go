@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jozefvalachovic/server/response"
@@ -16,6 +17,35 @@ import (
 // workloads while still preventing runaway handlers from holding connections
 // indefinitely.
 const DefaultRequestTimeout = 30 * time.Second
+
+// timeoutTotal counts requests that exceeded the handler deadline (a 504 was
+// injected or a partial response was already committed). leakedTotal counts
+// timed-out handlers that were still running after WarnOnLeakAfter elapsed
+// (only tracked when WarnOnLeakAfter > 0). Both are process-global monotonic
+// counters exposed via TimeoutMetrics for wiring into a metrics backend.
+var (
+	timeoutTotal atomic.Int64
+	leakedTotal  atomic.Int64
+)
+
+// TimeoutStats is a point-in-time snapshot of Timeout middleware counters.
+type TimeoutStats struct {
+	// Timeouts is the number of requests that exceeded their handler deadline.
+	Timeouts int64
+	// Leaked is the number of timed-out handlers still running after
+	// WarnOnLeakAfter elapsed. Always 0 when WarnOnLeakAfter is disabled.
+	Leaked int64
+}
+
+// TimeoutMetrics returns a snapshot of the Timeout middleware's global
+// counters. Safe to call concurrently. Useful for exporting to Prometheus or
+// logging periodic summaries.
+func TimeoutMetrics() TimeoutStats {
+	return TimeoutStats{
+		Timeouts: timeoutTotal.Load(),
+		Leaked:   leakedTotal.Load(),
+	}
+}
 
 // TimeoutConfig configures the Timeout middleware.
 type TimeoutConfig struct {
@@ -68,6 +98,15 @@ type TimeoutConfig struct {
 	//	    SSEPaths:  []string{"/events", "/stream/"},
 	//	})
 	SSEPaths []string
+
+	// WarnOnLeakAfter, when > 0, enables leaked-goroutine detection. After a
+	// request times out, a lightweight detector goroutine waits up to this
+	// additional duration for the handler goroutine to finish. If the handler
+	// is still running when the window elapses, a warning is logged so
+	// operators can alert on handlers that ignore context cancellation (see
+	// the handler-goroutine-lifetime note on Timeout). 0 (default) disables
+	// the detector so no extra goroutine is spawned per timed-out request.
+	WarnOnLeakAfter time.Duration
 }
 
 // Timeout enforces a per-request deadline on every handler in the chain.
@@ -92,6 +131,20 @@ type TimeoutConfig struct {
 //   - Wrap blocking I/O with context.AfterFunc or a select on ctx.Done().
 //   - For handlers that intentionally exceed the deadline, add them to
 //     SkipPaths rather than relying on Timeout to mask long-running work.
+//
+// Concrete anti-pattern — a synchronous database/sql call made WITHOUT a
+// context-aware method leaks the goroutine past the deadline:
+//
+//	// BAD: db.Query ignores the request context, so the query keeps running
+//	// (and holds a connection) even after the client received a 504.
+//	rows, err := db.Query("SELECT … FROM big_table")
+//
+//	// GOOD: QueryContext observes r.Context(), so cancellation on timeout
+//	// aborts the query and returns the connection to the pool promptly.
+//	rows, err := db.QueryContext(r.Context(), "SELECT … FROM big_table")
+//
+// Set WarnOnLeakAfter to have the middleware log a warning when a handler is
+// still running well past its deadline, making such leaks observable.
 //
 // # Streaming / SSE handlers
 //
@@ -140,6 +193,7 @@ func Timeout(cfgs ...TimeoutConfig) func(http.Handler) http.Handler {
 		skipPaths = append(skipPaths[:len(skipPaths):len(skipPaths)], cfg.SSEPaths...)
 	}
 	skip := newPathSkipper(skipPaths)
+	leakWarnAfter := cfg.WarnOnLeakAfter
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -185,6 +239,16 @@ func Timeout(cfgs ...TimeoutConfig) func(http.Handler) http.Handler {
 			case <-done:
 				// Handler completed normally.
 			case <-ctx.Done():
+				// A deadline (or client cancellation) fired before the handler
+				// returned. Make the event observable: the handler goroutine may
+				// still be running because Go cannot forcibly preempt it.
+				logger.LogWarn("Request exceeded handler deadline; handler goroutine may still be running",
+					"path", r.URL.Path,
+					"method", r.Method,
+					"timeout", timeout.String(),
+				)
+				timeoutTotal.Add(1)
+
 				// timeout() atomically marks the writer as timed out.
 				// Returns true only if the handler had not yet written anything,
 				// meaning we are safe to write the 504 to the original ResponseWriter.
@@ -197,6 +261,29 @@ func Timeout(cfgs ...TimeoutConfig) func(http.Handler) http.Handler {
 				}
 				// If timeout() returns false the handler already started writing;
 				// no 504 is injected — the partial response is the best we can do.
+
+				// Optional leak detector: spawn a short-lived goroutine that
+				// distinguishes "slow but eventually completes" from "wedged".
+				// Only enabled when WarnOnLeakAfter > 0 so the common path does
+				// not pay for an extra goroutine per timed-out request.
+				if leakWarnAfter > 0 {
+					go func() {
+						timer := time.NewTimer(leakWarnAfter)
+						defer timer.Stop()
+						select {
+						case <-done:
+							// Handler finished within the grace window — no leak.
+						case <-timer.C:
+							leakedTotal.Add(1)
+							logger.LogWarn("Handler still running long after deadline (possible goroutine leak)",
+								"path", r.URL.Path,
+								"method", r.Method,
+								"timeout", timeout.String(),
+								"warnAfter", leakWarnAfter.String(),
+							)
+						}
+					}()
+				}
 			}
 		})
 	}

@@ -99,10 +99,15 @@ func withCSP(h http.HandlerFunc) http.HandlerFunc {
 //	/cache/entry/{k}  — DELETE a single cache key (AJAX, protected)
 //	/cache/flush      — POST to flush all cache keys (AJAX, protected)
 func Register(mux *http.ServeMux, cfg Config) {
-	// Propagate the X-Forwarded-Proto trust decision into the auth helpers.
-	// Stored as a package var rather than threaded through every helper to
-	// keep the existing signatures; admin is not re-entrant so this is safe.
-	trustXFP = cfg.TrustXForwardedProto
+	// The admin UI is a process-wide singleton by design: exactly one admin
+	// surface exists per server, wired once from NewHTTPServer. Configuration
+	// that the auth helpers need (currently the X-Forwarded-Proto trust
+	// decision) is therefore stored in a package var rather than threaded
+	// through every helper signature. setRegistrationConfig records it once and
+	// loudly rejects a second, conflicting Register call so the invariant can
+	// never silently drift (e.g. two servers in one process with different
+	// TrustXForwardedProto values).
+	setRegistrationConfig(cfg.TrustXForwardedProto)
 
 	// Hash the plaintext ADMIN_SECRET with PBKDF2 so the raw password is
 	// not retained in package state after bootstrap.

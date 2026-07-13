@@ -159,8 +159,13 @@ type RetryConfig struct {
 	// Multiplier is the exponential growth factor. Default: 2.0.
 	Multiplier float64
 
-	// JitterFraction adds random jitter up to this fraction of the backoff
-	// duration to spread retry storms. Default: 0.2 (±20%).
+	// JitterFraction sizes the random jitter band as a fraction of the
+	// computed backoff, using an "equal jitter" strategy: the delay is
+	// base*(1-JitterFraction) plus a uniform random value in
+	// [0, base*JitterFraction]. This is always non-negative and, unlike a
+	// symmetric ±jitter, never collapses toward zero, which spreads retry
+	// storms without occasionally hammering the server with near-immediate
+	// retries. Default: 0.2 (delay in [0.8·base, 1.0·base]).
 	JitterFraction float64
 
 	// ShouldRetry is called with the response (may be nil) and error to decide
@@ -373,7 +378,11 @@ func New(cfg Config) *Client {
 		if r.MaxBackoff <= 0 {
 			r.MaxBackoff = 10 * time.Second
 		}
-		if r.Multiplier <= 0 {
+		// Multiplier must be >= 1, otherwise backoff would shrink on each
+		// attempt (e.g. 0.5 halves the delay every retry), defeating the point
+		// of exponential backoff. Clamp any value below 1 (including the zero
+		// default) up to the standard 2.0.
+		if r.Multiplier < 1 {
 			r.Multiplier = 2.0
 		}
 		if r.JitterFraction <= 0 {
@@ -558,8 +567,13 @@ func (c *Client) Delete(ctx context.Context, url string) (*http.Response, error)
 
 func (c *Client) backoffDuration(attempt int) time.Duration {
 	base := float64(c.retry.InitialBackoff) * math.Pow(c.retry.Multiplier, float64(attempt-1))
-	jitter := base * c.retry.JitterFraction * (rand.Float64()*2 - 1)
-	d := max(min(time.Duration(base+jitter), c.retry.MaxBackoff), 0)
+	// Equal jitter: keep a fixed floor of base*(1-JitterFraction) and add a
+	// uniform random component within base*JitterFraction. The result is always
+	// in [base*(1-frac), base] and never negative, so retries stay spread out
+	// without the symmetric-jitter risk of collapsing toward an immediate retry.
+	band := base * c.retry.JitterFraction
+	delay := (base - band) + rand.Float64()*band
+	d := max(min(time.Duration(delay), c.retry.MaxBackoff), 0)
 	return d
 }
 
