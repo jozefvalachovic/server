@@ -1,12 +1,16 @@
 package server_test
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,10 +27,45 @@ func TestHTTPServerConfig_Validate_NegativeMaxHeaderBytes(t *testing.T) {
 	}
 }
 
+func TestHTTPServerConfig_Validate_NegativeMaxHeaderValueCount(t *testing.T) {
+	cfg := server.HTTPServerConfig{MaxHeaderValueCount: -1}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for negative MaxHeaderValueCount")
+	}
+}
+
 func TestHTTPServerConfig_Validate_NegativeTimeoutTimeout(t *testing.T) {
 	cfg := server.HTTPServerConfig{Timeout: &middleware.TimeoutConfig{Timeout: -1}}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error for negative Timeout.Timeout")
+	}
+}
+
+func TestHTTPServerConfig_Validate_NegativeReadHeaderTimeout(t *testing.T) {
+	cfg := server.HTTPServerConfig{ReadHeaderTimeout: -1}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for negative ReadHeaderTimeout")
+	}
+}
+
+func TestServerConfig_Validate_NegativeCertReloadInterval(t *testing.T) {
+	httpCfg := server.HTTPServerConfig{CertReloadInterval: -1}
+	if err := httpCfg.Validate(); err == nil {
+		t.Fatal("expected HTTP config error for negative CertReloadInterval")
+	}
+	tcpCfg := server.TCPServerConfig{CertReloadInterval: -1}
+	if err := tcpCfg.Validate(); err == nil {
+		t.Fatal("expected TCP config error for negative CertReloadInterval")
+	}
+}
+
+func TestServerConfig_Validate_NestedMetrics(t *testing.T) {
+	metricsCfg := &server.MetricsServerConfig{}
+	if err := (&server.HTTPServerConfig{MetricsServerConfig: metricsCfg}).Validate(); err == nil {
+		t.Fatal("expected HTTP config error for invalid nested metrics config")
+	}
+	if err := (&server.TCPServerConfig{MetricsServerConfig: metricsCfg}).Validate(); err == nil {
+		t.Fatal("expected TCP config error for invalid nested metrics config")
 	}
 }
 
@@ -94,6 +133,25 @@ func TestMetricsServerConfig_Validate_Good(t *testing.T) {
 	}
 }
 
+func TestMetricsServerConfig_Validate_WeakTLS(t *testing.T) {
+	cfg := &server.MetricsServerConfig{
+		Handler:   http.DefaultServeMux,
+		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS10},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for metrics TLS below 1.2")
+	}
+}
+
+func TestStartMetricsServer_InvalidConfig(t *testing.T) {
+	if _, err := server.StartMetricsServer(nil); err == nil {
+		t.Fatal("expected error for nil config")
+	}
+	if _, err := server.StartMetricsServer(&server.MetricsServerConfig{}); err == nil {
+		t.Fatal("expected error for nil handler")
+	}
+}
+
 // ── NewHTTPServer env validation ──────────────────────────────────────────
 
 func TestNewHTTPServer_MissingPort(t *testing.T) {
@@ -158,6 +216,130 @@ func freePort(t *testing.T) string {
 	return fmt.Sprintf("%d", port)
 }
 
+func freePortForHost(t *testing.T, host string) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
+	if err != nil {
+		t.Skipf("host %s is unavailable: %v", host, err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	_ = listener.Close()
+	return fmt.Sprintf("%d", port)
+}
+
+func TestHTTPServer_IPv6(t *testing.T) {
+	port := freePortForHost(t, "::1")
+	t.Setenv("HTTP_HOST", "::1")
+	t.Setenv("HTTP_PORT", port)
+
+	srv, err := server.NewHTTPServer(http.NewServeMux(), "test", "0.1.0", server.HTTPServerConfig{})
+	if err != nil {
+		t.Fatalf("NewHTTPServer: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(srv.ForceShutdown)
+}
+
+func TestHTTPServer_InvalidTLSCertificateFailsStart(t *testing.T) {
+	port := freePort(t)
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	keyPath := filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certPath, []byte("invalid certificate"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte("invalid key"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HTTP_HOST", "127.0.0.1")
+	t.Setenv("HTTP_PORT", port)
+	t.Setenv("HTTP_TLS_CERT_PATH", certPath)
+	t.Setenv("HTTP_TLS_KEY_PATH", keyPath)
+
+	srv, err := server.NewHTTPServer(http.NewServeMux(), "test", "0.1.0", server.HTTPServerConfig{
+		TLSConfig: server.DefaultTLSConfig(),
+	})
+	if err != nil {
+		t.Fatalf("NewHTTPServer: %v", err)
+	}
+	if err := srv.Start(); err == nil {
+		t.Fatal("expected invalid certificate to fail Start")
+	}
+}
+
+func TestMetricsServer_IPv6(t *testing.T) {
+	port := freePortForHost(t, "::1")
+	t.Setenv("METRICS_HOST", "::1")
+	t.Setenv("METRICS_PORT", port)
+
+	metricsServer, err := server.StartMetricsServer(&server.MetricsServerConfig{Handler: http.NotFoundHandler()})
+	if err != nil {
+		t.Fatalf("StartMetricsServer: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = metricsServer.Shutdown(ctx)
+	})
+}
+
+func TestMetricsServer_BindError(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	t.Setenv("METRICS_HOST", "127.0.0.1")
+	t.Setenv("METRICS_PORT", fmt.Sprintf("%d", listener.Addr().(*net.TCPAddr).Port))
+
+	if _, err := server.StartMetricsServer(&server.MetricsServerConfig{Handler: http.NotFoundHandler()}); err == nil {
+		t.Fatal("expected metrics bind error")
+	}
+}
+
+func TestMetricsServer_PprofIsOptIn(t *testing.T) {
+	tests := []struct {
+		name        string
+		enablePprof bool
+		wantStatus  int
+	}{
+		{name: "disabled", wantStatus: http.StatusNotFound},
+		{name: "enabled", enablePprof: true, wantStatus: http.StatusOK},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			port := freePort(t)
+			t.Setenv("METRICS_HOST", "127.0.0.1")
+			t.Setenv("METRICS_PORT", port)
+
+			metricsServer, err := server.StartMetricsServer(&server.MetricsServerConfig{
+				Handler:     http.NotFoundHandler(),
+				EnablePprof: tt.enablePprof,
+			})
+			if err != nil {
+				t.Fatalf("StartMetricsServer: %v", err)
+			}
+			t.Cleanup(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				_ = metricsServer.Shutdown(ctx)
+			})
+
+			resp, err := http.Get("http://" + net.JoinHostPort("127.0.0.1", port) + "/debug/pprof/goroutineleak?debug=1")
+			if err != nil {
+				t.Fatalf("GET goroutineleak profile: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("expected status %d, got %d", tt.wantStatus, resp.StatusCode)
+			}
+		})
+	}
+}
+
 func TestHTTPServer_StartShutdown(t *testing.T) {
 	port := freePort(t)
 	t.Setenv("HTTP_HOST", "127.0.0.1")
@@ -206,6 +388,40 @@ func TestHTTPServer_StartShutdown(t *testing.T) {
 		t.Fatalf("port should be released after shutdown: %v", err)
 	}
 	_ = ln.Close()
+}
+
+func TestHTTPServer_MaxHeaderValueCount(t *testing.T) {
+	port := freePort(t)
+	t.Setenv("HTTP_HOST", "127.0.0.1")
+	t.Setenv("HTTP_PORT", port)
+
+	srv, err := server.NewHTTPServer(http.NewServeMux(), "test", "0.1.0", server.HTTPServerConfig{
+		MaxHeaderValueCount: 2,
+	})
+	if err != nil {
+		t.Fatalf("NewHTTPServer: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(srv.ForceShutdown)
+
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", port), 2*time.Second)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: localhost\r\nX-Test: one\r\nX-Test: two\r\nX-Test: three\r\n\r\n"); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	statusLine, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if !strings.Contains(statusLine, " 431 ") {
+		t.Fatalf("expected 431 response, got %q", strings.TrimSpace(statusLine))
+	}
 }
 
 func TestHTTPServer_ForceShutdown(t *testing.T) {
@@ -287,6 +503,25 @@ func TestTCPServer_Nil(t *testing.T) {
 	if err := srv.Start(); err == nil {
 		t.Fatal("nil TCPServer Start should return error")
 	}
+	if err := srv.GracefulShutdown(context.Background()); err != nil {
+		t.Fatalf("nil GracefulShutdown should return nil, got %v", err)
+	}
+	srv.ForceShutdown()
+}
+
+func TestTCPServer_IPv6(t *testing.T) {
+	port := freePortForHost(t, "::1")
+	t.Setenv("TCP_HOST", "::1")
+	t.Setenv("TCP_PORT", port)
+
+	srv, err := server.NewTCPServer(func(net.Conn) {}, "test", "0.1.0", server.TCPServerConfig{})
+	if err != nil {
+		t.Fatalf("NewTCPServer: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(srv.ForceShutdown)
 }
 
 // ── TCP server lifecycle ──────────────────────────────────────────────────

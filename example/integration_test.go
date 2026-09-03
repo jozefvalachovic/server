@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -73,8 +74,8 @@ func setupIntegrationServer(t *testing.T) *httptest.Server {
 		}),
 		middleware.RequestID(middleware.RequestIDConfig{}),
 	}
-	for i := len(stack) - 1; i >= 0; i-- {
-		handler = stack[i](handler)
+	for _, middleware := range slices.Backward(stack) {
+		handler = middleware(handler)
 	}
 
 	ts := httptest.NewServer(handler)

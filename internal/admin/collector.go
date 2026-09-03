@@ -13,12 +13,12 @@ import (
 
 // routeStats tracks atomic counters for a single route pattern.
 type routeStats struct {
-	count   int64
-	errors  int64 // 5xx responses
-	totalMs int64 // sum of milliseconds
-	minMs   int64 // min latency (initialised to MaxInt64)
-	maxMs   int64 // max latency
-	totalRx int64 // bytes sent to clients
+	count   atomic.Int64
+	errors  atomic.Int64 // 5xx responses
+	totalMs atomic.Int64 // sum of milliseconds
+	minMs   int64        // min latency (initialised to MaxInt64)
+	maxMs   atomic.Int64 // max latency
+	totalRx atomic.Int64 // bytes sent to clients
 }
 
 // Collector gathers per-route HTTP metrics via its Middleware method.
@@ -95,11 +95,11 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 		}
 
 		s := c.stats(pattern)
-		atomic.AddInt64(&s.count, 1)
-		atomic.AddInt64(&s.totalMs, ms)
-		atomic.AddInt64(&s.totalRx, cw.bytes)
+		s.count.Add(1)
+		s.totalMs.Add(ms)
+		s.totalRx.Add(cw.bytes)
 		if cw.status >= 500 {
-			atomic.AddInt64(&s.errors, 1)
+			s.errors.Add(1)
 		}
 		// CAS min
 		for {
@@ -110,8 +110,8 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 		}
 		// CAS max
 		for {
-			old := atomic.LoadInt64(&s.maxMs)
-			if ms <= old || atomic.CompareAndSwapInt64(&s.maxMs, old, ms) {
+			old := s.maxMs.Load()
+			if ms <= old || s.maxMs.CompareAndSwap(old, ms) {
 				break
 			}
 		}
@@ -148,11 +148,11 @@ func (c *Collector) Snapshots() []RouteSnapshot {
 	var out []RouteSnapshot
 	c.m.Range(func(k, v any) bool {
 		s := v.(*routeStats)
-		count := atomic.LoadInt64(&s.count)
+		count := s.count.Load()
 		var avgMs, avgBytes float64
 		if count > 0 {
-			avgMs = float64(atomic.LoadInt64(&s.totalMs)) / float64(count)
-			avgBytes = float64(atomic.LoadInt64(&s.totalRx)) / float64(count)
+			avgMs = float64(s.totalMs.Load()) / float64(count)
+			avgBytes = float64(s.totalRx.Load()) / float64(count)
 		}
 		minMs := atomic.LoadInt64(&s.minMs)
 		if minMs == math.MaxInt64 {
@@ -161,10 +161,10 @@ func (c *Collector) Snapshots() []RouteSnapshot {
 		out = append(out, RouteSnapshot{
 			Pattern:    k.(string),
 			Count:      count,
-			Errors5xx:  atomic.LoadInt64(&s.errors),
+			Errors5xx:  s.errors.Load(),
 			AvgLatency: avgMs,
 			MinLatency: minMs,
-			MaxLatency: atomic.LoadInt64(&s.maxMs),
+			MaxLatency: s.maxMs.Load(),
 			AvgBytes:   avgBytes,
 		})
 		return true
@@ -180,9 +180,9 @@ func (c *Collector) Summary() (totalReqs, total5xx int64, avgLatencyMs float64) 
 	var sumMs int64
 	c.m.Range(func(_, v any) bool {
 		s := v.(*routeStats)
-		totalReqs += atomic.LoadInt64(&s.count)
-		total5xx += atomic.LoadInt64(&s.errors)
-		sumMs += atomic.LoadInt64(&s.totalMs)
+		totalReqs += s.count.Load()
+		total5xx += s.errors.Load()
+		sumMs += s.totalMs.Load()
 		return true
 	})
 	if totalReqs > 0 {

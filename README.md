@@ -3,7 +3,7 @@
 [![CI](https://github.com/jozefvalachovic/server/actions/workflows/ci.yml/badge.svg)](https://github.com/jozefvalachovic/server/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/jozefvalachovic/server/graph/badge.svg)](https://codecov.io/gh/jozefvalachovic/server)
 
-Reusable building blocks for Go HTTP and TCP servers. One dependency (`logger/v4`), Go 1.26+.
+Reusable building blocks for Go HTTP and TCP servers. The root module has one dependency (`logger/v4`) and requires Go 1.27+.
 
 ```
 go get github.com/jozefvalachovic/server@latest
@@ -18,13 +18,13 @@ go get github.com/jozefvalachovic/server@latest
 - [server](#server-1) — HTTP, TCP, metrics servers and health checks
 - [Middleware](#middleware) — Auth, CORS, rate-limit, cache, compress, security, timeout, …
   - [Middleware ordering](#middleware-ordering)
-- [routes](#routes) — Route registration, method routing, swagger/MCP helpers
+- [routes](#routes) — Route registration, method routing, and Swagger helpers
 - [response](#response) — Typed JSON response writers and request body decoding
 - [request](#request) — IP address extraction, email validation
 - [Request-scoped logging](#request-scoped-logging) — Automatic logger context enrichment
 - [cache](#cache) — In-memory key-value store with TTL, eviction, and stats
 - [client](#client) — Resilient HTTP client with retry and circuit breaker
-- [mcp](#mcp) — Model Context Protocol tool server
+- [mcp](#mcp) — Independent latest-only Model Context Protocol module
 - [swagger](#swagger) — Auto-generated API documentation UI
 - [admin](#admin) — Password-protected metrics and cache explorer UI
 - [watch](#watch) — Hot-reload file watcher for development
@@ -115,12 +115,12 @@ Run the bundled example with hot-reload:
 | --------------------------- | ------------------- | ------------------------------------------------------------- |
 | [`server`](#server-1)       | `server/server`     | HTTP, TCP, and metrics servers with graceful shutdown         |
 | [`middleware`](#middleware) | `server/middleware` | Auth, CORS, rate-limit, cache, compress, security, timeout, … |
-| [`routes`](#routes)         | `server/routes`     | Route registration, method routing, swagger/MCP helpers       |
+| [`routes`](#routes)         | `server/routes`     | Route registration, method routing, and Swagger helpers       |
 | [`response`](#response)     | `server/response`   | Typed JSON response writers and request body decoding         |
 | [`request`](#request)       | `server/request`    | IP address extraction, email validation                       |
 | [`cache`](#cache)           | `server/cache`      | In-memory key-value store with TTL, eviction, and stats       |
 | [`client`](#client)         | `server/client`     | Resilient HTTP client with retry and circuit breaker          |
-| [`mcp`](#mcp)               | `server/mcp`        | Model Context Protocol (MCP) tool server                      |
+| [`mcp`](#mcp)               | `server/mcp`        | Independent latest-only MCP server module                     |
 | [`swagger`](#swagger)       | `server/swagger`    | Auto-generated Swagger UI from Go types                       |
 | [`watch`](#watch)           | `server/watch`      | Hot-reload file watcher for development                       |
 
@@ -158,6 +158,7 @@ srv, err := server.NewHTTPServer(mux, "app", "1.0.0", server.HTTPServerConfig{
     WriteTimeout: 60 * time.Second,
     MaxConns:     10_000,
     MaxHeaderBytes: 1 << 20,        // 1 MiB (default)
+    MaxHeaderValueCount: 100,       // total header values per request
     TLSConfig:    tlsCfg,           // reads HTTP_TLS_CERT_PATH / HTTP_TLS_KEY_PATH
     AutoCertReload: true,           // hot-swap certs without restart
     CORS:         &server.CORSConfig{AllowedOrigins: []string{"https://example.com"}},
@@ -184,6 +185,7 @@ srv, err := server.NewHTTPServer(mux, "app", "1.0.0", server.HTTPServerConfig{
 | `WriteTimeout`        | `time.Duration`                                   | 60 s                   | Max duration for writing the response                                  |
 | `MaxConns`            | `int`                                             | 0 (unlimited)          | Max concurrent HTTP connections via listener semaphore                 |
 | `MaxHeaderBytes`      | `int`                                             | 1 MiB                  | Max size of request headers                                            |
+| `MaxHeaderValueCount` | `int`                                             | net/http default       | Max total header values per request; 0 uses the standard-library limit |
 | `MetricsServerConfig` | `*MetricsServerConfig`                            | nil                    | Embedded metrics sidecar (e.g. Prometheus)                             |
 | `AuditConfig`         | `*HTTPAuditConfig`                                | nil                    | Structured audit logging per request                                   |
 | `OTelBridge`          | `*OTelBridgeConfig`                               | nil                    | OpenTelemetry log bridge (service.name + level mapping)                |
@@ -285,19 +287,37 @@ result := hc.Result(ctx) // HealthCheckResult{Status, Checks, Version}
 
 Health status: `ok` (all pass), `degraded` (some non-critical fail — still returns 200), `down` (any critical fail, or all fail — returns 503).
 
+The configured timeout bounds the entire readiness evaluation. Checks should still honor context cancellation so their own goroutines can exit promptly; a non-cooperative check is reported as down without blocking the readiness response indefinitely.
+
 ### Metrics server
 
 A separate HTTP server for Prometheus or pprof handlers:
 
 ```go
-ms, _ := server.StartMetricsServer(&server.MetricsServerConfig{Handler: promHandler})
-defer ms.Shutdown(ctx)
+ms, err := server.StartMetricsServer(&server.MetricsServerConfig{
+    Handler:     promHandler,
+    EnablePprof: true,
+})
+if err != nil {
+    return err // invalid configuration, certificate, or bind address
+}
+defer func() {
+    shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    _ = ms.Shutdown(shutdownCtx)
+}()
 ```
 
-| Environment variable | Required | Description                                    |
-| -------------------- | -------- | ---------------------------------------------- |
-| `METRICS_HOST`       | no       | Bind address (default: `127.0.0.1` / loopback) |
-| `METRICS_PORT`       | yes      | Listen port                                    |
+`StartMetricsServer` binds the listener and loads any TLS certificate before returning, so startup failures are reported synchronously.
+
+`EnablePprof` is off by default. When enabled, the standard `/debug/pprof/` subtree is mounted on the metrics listener, including Go 1.27's `/debug/pprof/goroutineleak` profile. Keep the listener on loopback or protect it with mTLS, a firewall, or a service mesh; profiles can expose sensitive process data.
+
+| Environment variable    | Required       | Description                                    |
+| ----------------------- | -------------- | ---------------------------------------------- |
+| `METRICS_HOST`          | no             | Bind address (default: `127.0.0.1` / loopback) |
+| `METRICS_PORT`          | yes            | Listen port                                    |
+| `METRICS_TLS_CERT_PATH` | when TLS is on | TLS certificate file path                      |
+| `METRICS_TLS_KEY_PATH`  | when TLS is on | TLS private key file path                      |
 
 ---
 
@@ -569,13 +589,13 @@ middleware.Timeout(middleware.TimeoutConfig{
 })
 ```
 
-| Field          | Type            | Default                                | Description                                                |
-| -------------- | --------------- | -------------------------------------- | ---------------------------------------------------------- |
-| `Timeout`      | `time.Duration` | 30 s                                   | Per-request handler deadline                               |
-| `ErrorMessage` | `string`        | "Request timed out. Please try again." | Message in the 504 response body                           |
-| `SkipPaths`    | `[]string`      | none                                   | Exact or prefix paths (trailing `/`) exempt from timeout   |
-| `SSEPaths`     | `[]string`      | none                                   | Convenience for streaming routes; merged into `SkipPaths`  |
-| `WarnOnLeakAfter` | `time.Duration` | 0 (disabled)                        | If > 0, log a warning when a timed-out handler is still running after this grace window |
+| Field             | Type            | Default                                | Description                                                                             |
+| ----------------- | --------------- | -------------------------------------- | --------------------------------------------------------------------------------------- |
+| `Timeout`         | `time.Duration` | 30 s                                   | Per-request handler deadline                                                            |
+| `ErrorMessage`    | `string`        | "Request timed out. Please try again." | Message in the 504 response body                                                        |
+| `SkipPaths`       | `[]string`      | none                                   | Exact or prefix paths (trailing `/`) exempt from timeout                                |
+| `SSEPaths`        | `[]string`      | none                                   | Convenience for streaming routes; merged into `SkipPaths`                               |
+| `WarnOnLeakAfter` | `time.Duration` | 0 (disabled)                           | If > 0, log a warning when a timed-out handler is still running after this grace window |
 
 When the deadline fires, a 504 response is written and `r.Context()` is cancelled. If the handler already committed a response, no 504 is injected. Panics inside the timeout goroutine are recovered.
 
@@ -717,9 +737,8 @@ routes.RegisterRouteList(mux, []routes.Route{
 // Simple readiness endpoint
 routes.RegisterReadinessEndpoint(mux, func() bool { return dbHealthy })
 
-// Mount sub-systems
+// Mount Swagger
 routes.RegisterSwagger(mux, "/docs", swagger.Config{...})
-routes.RegisterMCP(mux, "/mcp", mcp.Config{...})
 ```
 
 `RegisterRoutesWithStore` passes the created `*cache.CacheStore` to each
@@ -854,24 +873,24 @@ if apiErr != nil {
 
 **Writers:**
 
-| Function                                   | Description                                                        |
-| ------------------------------------------ | ------------------------------------------------------------------ |
-| `APIResponseWriter[T]`                     | Standard success response                                          |
-| `APIResponseWriterWithMessage[T]`          | Success response with informational message                        |
-| `APIResponseWriterWithPagination[T]`       | Success response with offset-based pagination                      |
-| `APIResponseWriterWithCursorPagination[T]` | Success response with cursor-based pagination                      |
-| `APIResponseWriterWithWarnings[T]`         | Success response with warning strings                              |
-| `APIResponseWriterWithETag[T]`             | Success response with ETag; returns 304 if `If-None-Match` matches |
-| `APICreated[T]`                            | 201 Created with `Location` header                                 |
-| `APINoContent`                             | 204 No Content (no body)                                           |
-| `APIErrorWriter[T]`                        | Generic error response from `APIError[T]`                          |
-| `APIBadRequest`                            | 400 shortcut with message + details                                |
-| `APIUnauthorized`                          | 401 shortcut                                                       |
-| `APIForbidden`                             | 403 shortcut                                                       |
-| `APINotFound`                              | 404 shortcut                                                       |
-| `APIConflict`                              | 409 shortcut                                                       |
-| `APIInternalError`                         | 500 shortcut                                                       |
-| `APIServiceUnavailable`                    | 503 shortcut                                                       |
+| Function                                   | Description                                                                |
+| ------------------------------------------ | -------------------------------------------------------------------------- |
+| `APIResponseWriter[T]`                     | Standard success response                                                  |
+| `APIResponseWriterWithMessage[T]`          | Success response with informational message                                |
+| `APIResponseWriterWithPagination[T]`       | Success response with offset-based pagination                              |
+| `APIResponseWriterWithCursorPagination[T]` | Success response with cursor-based pagination                              |
+| `APIResponseWriterWithWarnings[T]`         | Success response with warning strings                                      |
+| `APIResponseWriterWithETag[T]`             | Deterministic response and ETag; returns 304 on a matching `If-None-Match` |
+| `APICreated[T]`                            | 201 Created with `Location` header                                         |
+| `APINoContent`                             | 204 No Content (no body)                                                   |
+| `APIErrorWriter[T]`                        | Generic error response from `APIError[T]`                                  |
+| `APIBadRequest`                            | 400 shortcut with message + details                                        |
+| `APIUnauthorized`                          | 401 shortcut                                                               |
+| `APIForbidden`                             | 403 shortcut                                                               |
+| `APINotFound`                              | 404 shortcut                                                               |
+| `APIConflict`                              | 409 shortcut                                                               |
+| `APIInternalError`                         | 500 shortcut                                                               |
+| `APIServiceUnavailable`                    | 503 shortcut                                                               |
 
 **SSE streaming:**
 
@@ -915,7 +934,7 @@ response.ErrServiceUnavailable // "Service Unavailable"
 
 The error shortcut functions (`APIBadRequest`, `APIUnauthorized`, etc.) and middleware already use these sentinels. Custom handlers can reference them to avoid allocating duplicate strings.
 
-`ValidateAndDecode[T]` rejects unknown JSON fields, nil/empty bodies, and bodies exceeding the `MaxBytesReader` limit (returns 413).
+`ValidateAndDecode[T]` uses Go 1.27's `encoding/json/v2` decoder. It rejects unknown, duplicate, and case-mismatched JSON object members, trailing JSON values, nil/empty bodies, and bodies exceeding the `MaxBytesReader` limit (returns 413).
 
 ---
 
@@ -946,10 +965,10 @@ func myHandler(w http.ResponseWriter, r *http.Request) {
 
 The enrichment chain builds incrementally through the middleware stack:
 
-| Middleware       | Fields added                   |
-| ---------------- | ------------------------------ |
-| `RequestID`      | `requestId`                    |
-| `TraceContext`    | `traceId`, `spanId`            |
+| Middleware     | Fields added        |
+| -------------- | ------------------- |
+| `RequestID`    | `requestId`         |
+| `TraceContext` | `traceId`, `spanId` |
 
 Custom middleware can further extend the context logger using the same pattern:
 
@@ -1093,56 +1112,93 @@ In half-open state, only one probe request is allowed through at a time. If a pr
 
 ## mcp
 
-[Model Context Protocol](https://modelcontextprotocol.io/) server implementing the MCP 2024-11-05 spec over Streamable HTTP (JSON-RPC 2.0).
+[Model Context Protocol](https://modelcontextprotocol.io/) support lives in an
+independent nested Go module so the official SDK and its transitive dependencies
+do not enter the root server module:
+
+```bash
+go get github.com/jozefvalachovic/server/mcp@latest
+```
+
+The module wraps `github.com/modelcontextprotocol/go-sdk` and supports only MCP
+`2026-07-28`. It intentionally does not implement the legacy `initialize`
+handshake or earlier protocol versions.
+
+`mcp.Version` reports the nested module's release version. `Config.Version`
+identifies the consuming server and is advertised to MCP clients.
 
 ```go
-routes.RegisterMCP(mux, "/mcp", mcp.Config{
+type GetProductInput struct {
+    ID int `json:"id" jsonschema:"product ID"`
+}
+
+type GetProductOutput struct {
+    Name string `json:"name"`
+}
+
+mcpServer, err := mcp.New(mcp.Config{
     Name:    "my-service",
     Version: "1.0.0",
     AllowedOrigins: []string{"https://app.example.com"},
-    AuthFunc: func(r *http.Request) error {
+    Authenticate: func(ctx context.Context, r *http.Request) (context.Context, error) {
         if r.Header.Get("Authorization") != "Bearer secret" {
-            return fmt.Errorf("unauthorized")
+            return nil, errors.New("unauthorized")
         }
-        return nil
+        return ctx, nil
     },
-    Tools: []mcp.Tool{
-        {
-            Name:        "get_product",
-            Description: "Fetch a product by ID.",
-            Input:       (*GetProductInput)(nil),
-            Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
-                var in GetProductInput
-                if err := json.Unmarshal(raw, &in); err != nil {
-                    return nil, err
-                }
-                return findProduct(in.ID)
-            },
-        },
+    MaxRequestBodyBytes: 1 << 20,
+    RequestTimeout:      30 * time.Second,
+    MaxConcurrent:       64,
+    RateLimit: &mcp.RateLimitConfig{
+        RequestsPerSecond: 100,
+        Burst:             200,
     },
 })
+if err != nil {
+    log.Fatal(err)
+}
+
+mcp.AddTool(mcpServer, &mcp.Tool{
+    Name:        "get_product",
+    Description: "Fetch a product by ID.",
+}, func(ctx context.Context, request *mcp.CallToolRequest, input GetProductInput) (*mcp.CallToolResult, GetProductOutput, error) {
+    product, err := findProduct(ctx, input.ID)
+    if err != nil {
+        return nil, GetProductOutput{}, err
+    }
+    return nil, GetProductOutput{Name: product.Name}, nil
+})
+
+mux.Handle("/mcp", mcpServer)
 ```
 
-**`Config` fields:**
+`AddTool` delegates JSON Schema inference, input/output validation, structured
+results, discovery, and protocol errors to the official SDK. Use `SDK()` for
+official SDK features such as prompts, resources, and custom methods. For local
+process integrations, call `RunStdio(ctx)` instead of mounting the HTTP handler.
 
-| Field            | Type                        | Default        | Description                                                 |
-| ---------------- | --------------------------- | -------------- | ----------------------------------------------------------- |
-| `Name`           | `string`                    | `"mcp-server"` | Server name in the `initialize` handshake                   |
-| `Version`        | `string`                    | `"1.0.0"`      | Server version in the `initialize` handshake                |
-| `Tools`          | `[]mcp.Tool`                | none           | Tools the agent may discover and call                       |
-| `AllowedOrigins` | `[]string`                  | `["*"]`        | Restricts the `Access-Control-Allow-Origin` header          |
-| `AuthFunc`       | `func(*http.Request) error` | nil (disabled) | Called before every POST; return non-nil to reject with 401 |
-| `DisableCORS`    | `bool`                      | false          | Turn off all CORS header management inside the handler      |
+Streamable HTTP is stateless and uses JSON responses. Clients send one POST per
+request with per-request protocol metadata; no session ID is issued, while GET
+and DELETE return 405. Request cancellation is propagated to tool contexts.
 
-POST request bodies are capped at **1 MiB** (`http.MaxBytesReader`) to prevent unbounded memory consumption from malicious or misconfigured agents.
+| `Config` field        | Default     | Description                                                           |
+| --------------------- | ----------- | --------------------------------------------------------------------- |
+| `Name`, `Version`     | required    | Server identity returned by discovery                                 |
+| `Instructions`        | empty       | Instructions advertised to clients                                    |
+| `Logger`              | SDK default | `*slog.Logger` used by the official SDK                               |
+| `AllowedOrigins`      | same-origin | Browser origins allowed by the built-in Origin policy; `*` allows any |
+| `Authenticate`        | disabled    | Authenticates HTTP requests and may return a derived context          |
+| `MaxRequestBodyBytes` | 1 MiB       | Maximum Streamable HTTP request body                                  |
+| `RequestTimeout`      | 30 s        | Deadline propagated through each HTTP request                         |
+| `MaxConcurrent`       | 64          | Process-local concurrent HTTP request limit                           |
+| `RateLimit`           | disabled    | Optional process-local token bucket                                   |
+| `Middleware`          | none        | Official SDK receiving middleware                                     |
+| `Hooks`               | none        | MCP method start/finish hooks for metrics and tracing                 |
+| `Audit`               | none        | HTTP completion hook, including policy rejections                     |
 
-> **CORS:** the MCP handler manages its own CORS headers. If the endpoint also
-> sits behind the server-wide `middleware.CORS` layer, both would write
-> `Access-Control-*` headers, producing duplicated/conflicting values that
-> browsers reject. Set `DisableCORS: true` to let the outer middleware own CORS,
-> or align `AllowedOrigins` in both layers.
-
-Input schemas are reflected automatically from the `Input` struct's fields and JSON tags.
+Do not stack a second CORS implementation around the MCP handler. Requests
+without an `Origin` header, including typical server-to-server clients, are
+accepted; browser requests require an explicit `AllowedOrigins` match.
 
 ---
 
@@ -1313,29 +1369,29 @@ if errors.Is(err, middleware.ErrRateLimitExceeded) {
 | `cache`      | `ErrInvalidMaxMemory`       | MaxMemoryMB ≤ 0                       |
 | `cache`      | `ErrEntryTooLarge`          | Entry exceeds `MaxMemoryMB` (evicted) |
 | `client`     | `ErrCircuitOpen`            | Circuit breaker is open               |
-| `middleware`  | `ErrRateLimitExceeded`      | Rate limit bucket exhausted           |
+| `middleware` | `ErrRateLimitExceeded`      | Rate limit bucket exhausted           |
 
 ---
 
 ## Environment variables
 
-| Variable              | Package    | Required    | Description                               |
-| --------------------- | ---------- | ----------- | ----------------------------------------- |
-| `HTTP_HOST`           | server     | yes         | HTTP bind address (IP literal)            |
-| `HTTP_PORT`           | server     | yes         | HTTP listen port                          |
-| `HTTP_TLS_CERT_PATH`  | server     | no          | TLS certificate path                      |
-| `HTTP_TLS_KEY_PATH`   | server     | no          | TLS key path                              |
-| `TCP_HOST`            | server     | for TCP     | TCP bind address                          |
-| `TCP_PORT`            | server     | for TCP     | TCP listen port                           |
-| `TCP_MAX_CONNS`       | config     | no          | Max TCP connections (default: 10 000)     |
-| `METRICS_HOST`        | server     | no          | Metrics bind address (default: 127.0.0.1) |
-| `METRICS_PORT`        | server     | for metrics | Metrics server port                       |
-| `ADMIN_NAME`          | admin      | for admin   | Admin UI username                         |
+| Variable              | Package    | Required    | Description                                  |
+| --------------------- | ---------- | ----------- | -------------------------------------------- |
+| `HTTP_HOST`           | server     | yes         | HTTP bind address (IP literal)               |
+| `HTTP_PORT`           | server     | yes         | HTTP listen port                             |
+| `HTTP_TLS_CERT_PATH`  | server     | no          | TLS certificate path                         |
+| `HTTP_TLS_KEY_PATH`   | server     | no          | TLS key path                                 |
+| `TCP_HOST`            | server     | for TCP     | TCP bind address                             |
+| `TCP_PORT`            | server     | for TCP     | TCP listen port                              |
+| `TCP_MAX_CONNS`       | config     | no          | Max TCP connections (default: 10 000)        |
+| `METRICS_HOST`        | server     | no          | Metrics bind address (default: 127.0.0.1)    |
+| `METRICS_PORT`        | server     | for metrics | Metrics server port                          |
+| `ADMIN_NAME`          | admin      | for admin   | Admin UI username                            |
 | `ADMIN_SECRET`        | admin      | for admin   | Admin UI password (PBKDF2-hashed at startup) |
-| `ADMIN_SIGNING_KEY`   | admin      | for admin   | HMAC key for session / CSRF signing       |
-| `MAX_REQUEST_SIZE_MB` | middleware | no          | Body size limit override (default: 10)    |
-| `ENV`                 | middleware | no          | Set to `production` for HSTS header       |
-| `DEV`                 | watch      | no          | Set to `1` to enable hot-reload           |
+| `ADMIN_SIGNING_KEY`   | admin      | for admin   | HMAC key for session / CSRF signing          |
+| `MAX_REQUEST_SIZE_MB` | middleware | no          | Body size limit override (default: 10)       |
+| `ENV`                 | middleware | no          | Set to `production` for HSTS header          |
+| `DEV`                 | watch      | no          | Set to `1` to enable hot-reload              |
 
 ---
 

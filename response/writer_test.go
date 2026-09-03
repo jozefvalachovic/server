@@ -426,6 +426,27 @@ func TestAPIResponseWriterWithETag_DifferentDataDifferentETag(t *testing.T) {
 	}
 }
 
+func TestAPIResponseWriterWithETag_MapOrderIsDeterministic(t *testing.T) {
+	first := make(map[string]int, 2)
+	first["bravo"] = 2
+	first["alpha"] = 1
+	second := make(map[string]int, 2)
+	second["alpha"] = 1
+	second["bravo"] = 2
+
+	rec1 := httptest.NewRecorder()
+	APIResponseWriterWithETag(rec1, httptest.NewRequest("GET", "/", nil), first, http.StatusOK)
+	rec2 := httptest.NewRecorder()
+	APIResponseWriterWithETag(rec2, httptest.NewRequest("GET", "/", nil), second, http.StatusOK)
+
+	if rec1.Header().Get("ETag") != rec2.Header().Get("ETag") {
+		t.Fatal("equivalent maps must produce the same ETag")
+	}
+	if rec1.Body.String() != rec2.Body.String() {
+		t.Fatal("equivalent maps must produce the same response body")
+	}
+}
+
 func TestAPIResponseWriterWithETag_MismatchedETag_FullResponse(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/test", nil)

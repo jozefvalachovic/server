@@ -150,7 +150,7 @@ func NewTCPServer(handler func(conn net.Conn), appName, appVersion string, cfg T
 	}
 
 	var metricsConfig *MetricsServerConfig
-	if cfg.MetricsServerConfig != nil && cfg.MetricsServerConfig.Handler != nil {
+	if cfg.MetricsServerConfig != nil {
 		metricsConfig = cfg.MetricsServerConfig
 	}
 
@@ -198,7 +198,7 @@ func NewTCPServer(handler func(conn net.Conn), appName, appVersion string, cfg T
 	writeTimeout := max(cfg.WriteTimeout, 0)
 
 	return &TCPServer{
-		addr:      host + ":" + port,
+		addr:      net.JoinHostPort(host, port),
 		tlsConfig: cfg.TLSConfig,
 		rejectMsg: rejectMsg,
 
@@ -263,24 +263,45 @@ func (s *TCPServer) Start() error {
 	// GracefulShutdown closes s.listener, which causes Accept() to return a
 	// non-nil error — that is the intentional shutdown mechanism.
 	s.wg.Add(1)
-	go func() {
+	go func(listener net.Listener) {
 		defer func() {
 			if r := recover(); r != nil {
 				s.log.LogError("Panic in accept loop", "panic", fmt.Sprint(r))
 			}
 			s.wg.Done()
 		}()
+		var retryDelay time.Duration
 		for {
-			conn, err := s.listener.Accept()
+			conn, err := listener.Accept()
 			if err != nil {
 				select {
 				case <-s.ctx.Done():
 					return // graceful shutdown
 				default:
-					s.log.LogError("Accept error", "error", err.Error())
-					continue
 				}
+				netErr, temporary := err.(net.Error)
+				if !temporary || !netErr.Temporary() { //nolint:staticcheck // net.Listener still uses temporary accept errors
+					s.log.LogError("TCP listener stopped after permanent accept error", "error", err.Error())
+					return
+				}
+				if retryDelay == 0 {
+					retryDelay = 5 * time.Millisecond
+				} else {
+					retryDelay = min(2*retryDelay, time.Second)
+				}
+				s.log.LogWarn("Temporary TCP accept error; retrying", "error", err.Error(), "retryDelay", retryDelay.String())
+				timer := time.NewTimer(retryDelay)
+				select {
+				case <-s.ctx.Done():
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return
+				case <-timer.C:
+				}
+				continue
 			}
+			retryDelay = 0
 
 			readTimeout := s.appReadTimeout
 			if !s.noReadTimeout && readTimeout == 0 {
@@ -327,7 +348,7 @@ func (s *TCPServer) Start() error {
 				}
 			}
 		}
-	}()
+	}(ln)
 
 	return nil
 }
@@ -414,6 +435,9 @@ func (c *deadlineConn) Close() error {
 // Safe to follow with ForceShutdown as an escalation if the graceful deadline
 // is exceeded — listener close is guarded by sync.Once.
 func (s *TCPServer) GracefulShutdown(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
 	s.log.LogInfo("Starting graceful shutdown...")
 	// Close the listener before cancelling the context so no new connections
 	// can be accepted after shutdown starts. Accept() returns net.ErrClosed
@@ -486,6 +510,9 @@ func (s *TCPServer) closeListener() {
 // Safe to call multiple times and safe to call after GracefulShutdown as an
 // escalation — listener close is guarded by sync.Once.
 func (s *TCPServer) ForceShutdown() {
+	if s == nil {
+		return
+	}
 	s.log.LogInfo("Forcefully closing TCP server...")
 	s.closeListener()
 	s.cancel()

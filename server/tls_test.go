@@ -149,6 +149,24 @@ func TestCertReloader_StopIsIdempotent(t *testing.T) {
 	r.Stop() // must not panic or deadlock
 }
 
+func TestCertReloader_StopIsConcurrentSafe(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	keyPath := filepath.Join(dir, "key.pem")
+
+	writeSelfSignedCert(t, certPath, keyPath, "concurrent-stop-test")
+	r, err := server.NewCertReloader(certPath, keyPath, server.WithPollInterval(time.Hour))
+	if err != nil {
+		t.Fatalf("NewCertReloader: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Go(r.Stop)
+	}
+	wg.Wait()
+}
+
 func TestCertReloader_ConcurrentGetCertificate(t *testing.T) {
 	dir := t.TempDir()
 	certPath := filepath.Join(dir, "cert.pem")

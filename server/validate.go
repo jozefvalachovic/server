@@ -15,6 +15,9 @@ func (c *HTTPServerConfig) Validate() error {
 	if c.ReadTimeout < 0 {
 		errs = append(errs, fmt.Errorf("ReadTimeout must be >= 0, got %s", c.ReadTimeout))
 	}
+	if c.ReadHeaderTimeout < 0 {
+		errs = append(errs, fmt.Errorf("ReadHeaderTimeout must be >= 0, got %s", c.ReadHeaderTimeout))
+	}
 	if c.WriteTimeout < 0 {
 		errs = append(errs, fmt.Errorf("WriteTimeout must be >= 0, got %s", c.WriteTimeout))
 	}
@@ -26,6 +29,12 @@ func (c *HTTPServerConfig) Validate() error {
 	}
 	if c.MaxHeaderBytes < 0 {
 		errs = append(errs, fmt.Errorf("MaxHeaderBytes must be >= 0, got %d", c.MaxHeaderBytes))
+	}
+	if c.MaxHeaderValueCount < 0 {
+		errs = append(errs, fmt.Errorf("MaxHeaderValueCount must be >= 0, got %d", c.MaxHeaderValueCount))
+	}
+	if c.CertReloadInterval < 0 {
+		errs = append(errs, fmt.Errorf("CertReloadInterval must be >= 0, got %s", c.CertReloadInterval))
 	}
 	if c.Timeout != nil && c.Timeout.Timeout < 0 {
 		errs = append(errs, fmt.Errorf("Timeout.Timeout must be >= 0, got %s", c.Timeout.Timeout))
@@ -45,6 +54,11 @@ func (c *HTTPServerConfig) Validate() error {
 			errs = append(errs, errors.New("TLSConfig.MinVersion is below TLS 1.2 — not recommended"))
 		}
 	}
+	if c.MetricsServerConfig != nil {
+		if err := c.MetricsServerConfig.Validate(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 
 	return errors.Join(errs...)
 }
@@ -59,6 +73,9 @@ func (c *TCPServerConfig) Validate() error {
 	if c.WriteTimeout < 0 {
 		errs = append(errs, fmt.Errorf("WriteTimeout must be >= 0, got %s", c.WriteTimeout))
 	}
+	if c.CertReloadInterval < 0 {
+		errs = append(errs, fmt.Errorf("CertReloadInterval must be >= 0, got %s", c.CertReloadInterval))
+	}
 	if c.RateLimitConfig != nil && c.RateLimitConfig.ConnectionsPerSecond <= 0 {
 		errs = append(errs, fmt.Errorf("RateLimitConfig.ConnectionsPerSecond must be > 0, got %f", c.RateLimitConfig.ConnectionsPerSecond))
 	}
@@ -69,14 +86,30 @@ func (c *TCPServerConfig) Validate() error {
 			errs = append(errs, errors.New("TLSConfig.MinVersion is below TLS 1.2 — not recommended"))
 		}
 	}
+	if c.MetricsServerConfig != nil {
+		if err := c.MetricsServerConfig.Validate(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 
 	return errors.Join(errs...)
 }
 
 // Validate checks for misconfigurations in the MetricsServerConfig.
 func (c *MetricsServerConfig) Validate() error {
-	if c.Handler == nil {
-		return errors.New("MetricsServerConfig.Handler must not be nil")
+	if c == nil {
+		return errors.New("MetricsServerConfig must not be nil")
 	}
-	return nil
+	var errs []error
+	if c.Handler == nil {
+		errs = append(errs, errors.New("MetricsServerConfig.Handler must not be nil"))
+	}
+	if c.TLSConfig != nil {
+		if c.TLSConfig.MinVersion == 0 {
+			errs = append(errs, errors.New("MetricsServerConfig.TLSConfig.MinVersion must be set explicitly"))
+		} else if c.TLSConfig.MinVersion < 0x0303 {
+			errs = append(errs, errors.New("MetricsServerConfig.TLSConfig.MinVersion is below TLS 1.2"))
+		}
+	}
+	return errors.Join(errs...)
 }

@@ -73,6 +73,29 @@ func TestHealthChecker_Timeout(t *testing.T) {
 	}
 }
 
+func TestHealthChecker_TimeoutBoundsNonCooperativeCheck(t *testing.T) {
+	hc := NewHealthChecker("", 50*time.Millisecond)
+	release := make(chan struct{})
+	hc.Register("stuck", func(context.Context) error {
+		<-release
+		return nil
+	})
+
+	start := time.Now()
+	result := hc.Result(context.Background())
+	close(release)
+
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("Result exceeded timeout bound: %s", elapsed)
+	}
+	if result.Status != HealthStatusDown {
+		t.Fatalf("want down for timed-out check, got %s", result.Status)
+	}
+	if result.Checks["stuck"].Error != context.DeadlineExceeded.Error() {
+		t.Fatalf("want deadline error, got %q", result.Checks["stuck"].Error)
+	}
+}
+
 func TestHealthChecker_DefaultTimeout(t *testing.T) {
 	hc := NewHealthChecker("", 0)
 	if hc.timeout != 5*time.Second {

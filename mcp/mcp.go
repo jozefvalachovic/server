@@ -1,599 +1,473 @@
-// Package mcp provides a zero-dependency Model Context Protocol (MCP) server
-// handler that exposes typed Go functions as tools callable by AI agents.
-//
-// The implementation follows the MCP 2024-11-05 specification using the
-// Streamable HTTP transport: a single POST endpoint accepts JSON-RPC 2.0
-// requests and returns JSON-RPC 2.0 responses. No external dependencies or
-// SSE streaming is required for the basic tool-call lifecycle.
-//
-// # Protocol flow
-//
-//  1. Agent sends initialize  → server replies with its capabilities.
-//  2. Agent sends initialized (notification, no id) → server replies 204.
-//  3. Agent sends tools/list  → server returns the tool catalogue.
-//  4. Agent sends tools/call  → server dispatches to Tool.Handler and returns
-//     the result in the MCP content-block format.
-//
-// # Usage
-//
-//	mux.Handle("/mcp", mcp.Handler(mcp.Config{
-//	    Name:    "my-service",
-//	    Version: "1.0.0",
-//	    Tools: []mcp.Tool{
-//	        {
-//	            Name:        "get_product",
-//	            Description: "Fetch a product by its numeric ID.",
-//	            Input:       (*GetProductInput)(nil),
-//	            Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
-//	                var in GetProductInput
-//	                if err := json.Unmarshal(raw, &in); err != nil {
-//	                    return nil, err
-//	                }
-//	                return findProduct(in.ID)
-//	            },
-//	        },
-//	    },
-//	}))
-//
-// Mount via routes.RegisterMCP for automatic trailing-slash handling:
-//
-//	routes.RegisterMCP(mux, "/mcp", mcp.Config{ … })
+// Package mcp provides a production wrapper around the official Model Context
+// Protocol Go SDK. It supports only protocol version 2026-07-28 and exposes
+// stateless Streamable HTTP and stdio transports.
 package mcp
 
 import (
-	"bytes"
-	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
+	"math"
 	"net/http"
-	"reflect"
+	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// ── Public API ────────────────────────────────────────────────────────────────
+const (
+	// ProtocolVersion is the only MCP protocol version accepted by this package.
+	ProtocolVersion = "2026-07-28"
 
-// Tool defines one MCP tool exposed to agents.
-type Tool struct {
-	// Name is the identifier agents use when calling this tool.
-	// Use snake_case (e.g. "list_products", "send_email").
-	Name string
+	DefaultMaxRequestBodyBytes = 1 << 20
+	DefaultRequestTimeout      = 30 * time.Second
+	DefaultMaxConcurrent       = 64
+)
 
-	// Description explains what the tool does. Agents use this to determine
-	// when to call the tool, so be precise and action-oriented.
-	Description string
+type (
+	Tool            = sdk.Tool
+	CallToolRequest = sdk.CallToolRequest
+	CallToolResult  = sdk.CallToolResult
+	Middleware      = sdk.Middleware
+	MethodHandler   = sdk.MethodHandler
+	Request         = sdk.Request
+	Result          = sdk.Result
+	Transport       = sdk.Transport
+)
 
-	// Input is a typed nil pointer (or zero value) of the struct that
-	// describes the tool's JSON input parameters. The package reflects its
-	// fields to produce a JSON Schema that agents use to compose calls.
-	//   Input: (*MyInputStruct)(nil)
-	// Pass nil for tools that take no parameters.
-	Input any
+// ToolHandler is a typed tool handler. Input and output schemas are inferred
+// and validated by the official SDK when registered with AddTool.
+type ToolHandler[In, Out any] func(context.Context, *CallToolRequest, In) (*CallToolResult, Out, error)
 
-	// Handler is invoked when the agent calls this tool. raw is the
-	// JSON-encoded arguments object exactly as sent by the agent; unmarshal
-	// it into the same type as Input. Return any JSON-serialisable value on
-	// success, or a non-nil error to signal a tool-level failure (the agent
-	// will see isError:true in the response).
-	Handler func(ctx context.Context, raw json.RawMessage) (any, error)
+// Authenticator authenticates an HTTP request. It may return a derived context
+// containing the authenticated principal or other request-scoped values.
+type Authenticator func(context.Context, *http.Request) (context.Context, error)
+
+// RateLimitConfig configures a process-local token bucket shared by all HTTP
+// requests handled by a Server.
+type RateLimitConfig struct {
+	RequestsPerSecond float64
+	Burst             int
 }
 
-// Config holds server metadata and the list of exposed tools.
+// RequestEvent describes one MCP method invocation. Hooks may use it for
+// tracing, metrics, or application audit records.
+type RequestEvent struct {
+	Method    string
+	StartedAt time.Time
+	Duration  time.Duration
+	Err       error
+}
+
+// RequestHooks observe MCP method handling. Start may return a derived context
+// that is propagated to the method handler. Finish runs synchronously.
+type RequestHooks struct {
+	Start  func(context.Context, string, Request) context.Context
+	Finish func(context.Context, RequestEvent)
+}
+
+// HTTPAuditEvent describes one HTTP request, including policy rejections that
+// do not reach MCP method dispatch.
+type HTTPAuditEvent struct {
+	StartedAt time.Time
+	Duration  time.Duration
+	Method    string
+	Path      string
+	Remote    string
+	Status    int
+}
+
 type Config struct {
-	// Name is the server name advertised during the initialize handshake.
-	Name string
-	// Version is the server version advertised during the initialize handshake.
-	Version string
-	// Tools is the list of tools the agent may discover and call.
-	Tools []Tool
-	// AllowedOrigins restricts the Access-Control-Allow-Origin header to the
-	// listed origins. When empty (the default) the header is set to "*".
-	//
-	// If the MCP endpoint is mounted behind the middleware.CORS layer, both
-	// layers will write CORS headers. To avoid duplicated or conflicting
-	// Access-Control-* values, either:
-	//   - Set identical origin lists in both Config.AllowedOrigins and
-	//     middleware.CORSConfig.AllowedOrigins, or
-	//   - Exclude the MCP path from middleware.CORS (e.g. via a path guard)
-	//     and let the MCP handler manage CORS alone.
-	AllowedOrigins []string
-	// AuthFunc is called before processing every JSON-RPC POST request.
-	// Return a non-nil error to reject the request with 401 Unauthorized.
-	// nil disables authentication (default).
-	AuthFunc func(r *http.Request) error
-	// DisableCORS turns off all CORS header management inside the MCP handler,
-	// including the OPTIONS pre-flight short-circuit. Set this to true when the
-	// endpoint is mounted behind the server-wide middleware.CORS layer so that
-	// exactly one layer owns the Access-Control-* headers; otherwise both layers
-	// write them, producing duplicated or conflicting values that browsers
-	// reject. When true, AllowedOrigins is ignored and the outer CORS middleware
-	// (or none) is fully responsible for CORS. Default: false.
-	DisableCORS bool
+	Name         string
+	Version      string
+	Instructions string
+	Logger       *slog.Logger
+
+	AllowedOrigins      []string
+	Authenticate        Authenticator
+	MaxRequestBodyBytes int64
+	RequestTimeout      time.Duration
+	MaxConcurrent       int
+	RateLimit           *RateLimitConfig
+
+	Middleware []Middleware
+	Hooks      RequestHooks
+	Audit      func(context.Context, HTTPAuditEvent)
 }
 
-// Handler returns an http.Handler that implements the MCP Streamable HTTP
-// transport. Mount it with routes.RegisterMCP for correct path handling.
-func Handler(cfg Config) http.Handler {
+// Server is a latest-only MCP server backed by the official Go SDK.
+type Server struct {
+	sdk     *sdk.Server
+	handler http.Handler
+}
+
+// New constructs a latest-only MCP server. Tools may be registered after New
+// and before the server begins handling requests.
+func New(cfg Config) (*Server, error) {
 	if cfg.Name == "" {
-		cfg.Name = "mcp-server"
+		return nil, errors.New("mcp: Name is required")
 	}
 	if cfg.Version == "" {
-		cfg.Version = "1.0.0"
+		return nil, errors.New("mcp: Version is required")
 	}
 
-	// Pre-build the tool catalogue once (schema reflection is not cheap).
-	catalogue := make([]toolDef, 0, len(cfg.Tools))
-	for _, t := range cfg.Tools {
-		catalogue = append(catalogue, toolDef{
-			tool:      t,
-			schema:    buildSchema(t.Input),
-			inputType: inputElemType(t.Input),
-		})
+	allowedOrigins, allowAnyOrigin, err := parseAllowedOrigins(cfg.AllowedOrigins)
+	if err != nil {
+		return nil, err
 	}
 
-	toolIndex := make(map[string]*toolDef, len(catalogue))
-	for i := range catalogue {
-		toolIndex[catalogue[i].tool.Name] = &catalogue[i]
+	maxBodyBytes := cfg.MaxRequestBodyBytes
+	if maxBodyBytes == 0 {
+		maxBodyBytes = DefaultMaxRequestBodyBytes
+	}
+	if maxBodyBytes < 0 {
+		return nil, fmt.Errorf("mcp: MaxRequestBodyBytes must be >= 0, got %d", cfg.MaxRequestBodyBytes)
 	}
 
-	// Pre-build static responses so no allocations occur on the hot path.
-	toolEntries := make([]toolEntry, len(catalogue))
-	for i, td := range catalogue {
-		toolEntries[i] = toolEntry{
-			Name:        td.tool.Name,
-			Description: td.tool.Description,
-			InputSchema: td.schema,
-		}
+	requestTimeout := cfg.RequestTimeout
+	if requestTimeout == 0 {
+		requestTimeout = DefaultRequestTimeout
 	}
-	capJSON, _ := json.Marshal(capabilityDoc{Name: cfg.Name, Version: cfg.Version, Protocol: "mcp"})
-	capJSON = append(capJSON, '\n')
-
-	allowedOrigins := cfg.AllowedOrigins
-	if len(allowedOrigins) == 0 {
-		allowedOrigins = []string{"*"}
+	if requestTimeout < 0 {
+		return nil, fmt.Errorf("mcp: RequestTimeout must be >= 0, got %s", cfg.RequestTimeout)
 	}
 
-	s := &server{
-		cfg:            cfg,
-		allowedOrigins: allowedOrigins,
-		tools:          catalogue,
-		toolIndex:      toolIndex,
-		initResult: initializeResult{
-			ProtocolVersion: "2024-11-05",
-			Capabilities:    initCapabilities{},
-			ServerInfo:      serverInfo{Name: cfg.Name, Version: cfg.Version},
+	maxConcurrent := cfg.MaxConcurrent
+	if maxConcurrent == 0 {
+		maxConcurrent = DefaultMaxConcurrent
+	}
+	if maxConcurrent < 0 {
+		return nil, fmt.Errorf("mcp: MaxConcurrent must be >= 0, got %d", cfg.MaxConcurrent)
+	}
+
+	limiter, err := newTokenBucket(cfg.RateLimit)
+	if err != nil {
+		return nil, err
+	}
+
+	sdkServer := sdk.NewServer(
+		&sdk.Implementation{Name: cfg.Name, Version: cfg.Version},
+		&sdk.ServerOptions{
+			Instructions: cfg.Instructions,
+			Logger:       cfg.Logger,
+			Capabilities: &sdk.ServerCapabilities{},
 		},
-		listResult:     toolsListResult{Tools: toolEntries},
-		capabilityJSON: capJSON,
+	)
+
+	middlewares := make([]sdk.Middleware, 0, len(cfg.Middleware)+2)
+	if cfg.Hooks.Start != nil || cfg.Hooks.Finish != nil {
+		middlewares = append(middlewares, requestHookMiddleware(cfg.Hooks))
 	}
-	return s
-}
+	middlewares = append(middlewares, latestOnlyMiddleware())
+	middlewares = append(middlewares, cfg.Middleware...)
+	sdkServer.AddReceivingMiddleware(middlewares...)
 
-// ── Internal types ─────────────────────────────────────────────────────────
+	base := sdk.NewStreamableHTTPHandler(
+		func(*http.Request) *sdk.Server { return sdkServer },
+		&sdk.StreamableHTTPOptions{
+			Stateless:                    true,
+			JSONResponse:                 true,
+			Logger:                       cfg.Logger,
+			MaxRequestBodyBytes:          maxBodyBytes,
+			PropagateRequestCancellation: true,
+		},
+	)
 
-type toolDef struct {
-	tool   Tool
-	schema inputSchema
-	// inputType is the concrete struct type derived from Tool.Input. Used
-	// to strict-decode tool/call arguments with DisallowUnknownFields before
-	// dispatching to Tool.Handler. nil when Tool.Input is nil (no-param tool).
-	inputType reflect.Type
-}
-
-// inputElemType returns the underlying struct type described by the value
-// passed to Tool.Input. Pointers are dereferenced once so callers may pass
-// either (*T)(nil) or T{}. Returns nil for nil inputs or non-struct types
-// (those will fall through to raw-handler dispatch without validation, so
-// tools remain functional if Input describes a map or primitive).
-func inputElemType(in any) reflect.Type {
-	if in == nil {
-		return nil
+	handler := http.Handler(base)
+	handler = withRequestTimeout(requestTimeout, handler)
+	handler = withConcurrencyLimit(maxConcurrent, handler)
+	handler = withRateLimit(limiter, handler)
+	handler = withAuthentication(cfg.Authenticate, handler)
+	handler = withOriginPolicy(allowedOrigins, allowAnyOrigin, handler)
+	if cfg.Audit != nil {
+		handler = withAudit(cfg.Audit, handler)
 	}
-	t := reflect.TypeOf(in)
-	if t.Kind() == reflect.Pointer {
-		t = t.Elem()
+
+	return &Server{sdk: sdkServer, handler: handler}, nil
+}
+
+// AddTool registers a typed tool. The official SDK infers and validates the
+// input and output schemas and populates structured results.
+func AddTool[In, Out any](server *Server, tool *Tool, handler ToolHandler[In, Out]) {
+	sdk.AddTool(server.sdk, tool, sdk.ToolHandlerFor[In, Out](handler))
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.handler.ServeHTTP(w, r)
+}
+
+// RunStdio serves MCP over stdin and stdout until the context is cancelled or
+// the peer closes the connection.
+func (s *Server) RunStdio(ctx context.Context) error {
+	return s.sdk.Run(ctx, &sdk.StdioTransport{})
+}
+
+// Run serves MCP over a persistent SDK transport.
+func (s *Server) Run(ctx context.Context, transport Transport) error {
+	if transport == nil {
+		return errors.New("mcp: transport is required")
 	}
-	if t.Kind() != reflect.Struct {
-		return nil
-	}
-	return t
+	return s.sdk.Run(ctx, transport)
 }
 
-type server struct {
-	cfg            Config
-	allowedOrigins []string // pre-computed, immutable after construction
-	tools          []toolDef
-	toolIndex      map[string]*toolDef // name → tool; O(1) dispatch
-	initResult     initializeResult    // pre-built, immutable after construction
-	listResult     toolsListResult     // pre-built, immutable after construction
-	capabilityJSON []byte              // pre-encoded GET response
+// SDK returns the underlying official SDK server for advanced features such
+// as prompts, resources, and custom methods.
+func (s *Server) SDK() *sdk.Server {
+	return s.sdk
 }
 
-// ── Typed response structs ────────────────────────────────────────────────────
-// Using concrete types instead of map[string]any eliminates per-request heap
-// allocations for every MCP method response.
-
-type initializeResult struct {
-	ProtocolVersion string           `json:"protocolVersion"`
-	Capabilities    initCapabilities `json:"capabilities"`
-	ServerInfo      serverInfo       `json:"serverInfo"`
+// AddReceivingMiddleware adds official SDK middleware to the server.
+func (s *Server) AddReceivingMiddleware(middleware ...Middleware) {
+	s.sdk.AddReceivingMiddleware(middleware...)
 }
 
-type initCapabilities struct {
-	Tools struct{} `json:"tools"`
-}
+func latestOnlyMiddleware() sdk.Middleware {
+	return func(next sdk.MethodHandler) sdk.MethodHandler {
+		return func(ctx context.Context, method string, req sdk.Request) (sdk.Result, error) {
+			requested := ""
+			if params := req.GetParams(); params != nil {
+				requested, _ = params.GetMeta()[sdk.MetaKeyProtocolVersion].(string)
+			}
+			if requested != ProtocolVersion {
+				data, _ := json.Marshal(sdk.UnsupportedProtocolVersionData{
+					Supported: []string{ProtocolVersion},
+					Requested: requested,
+				})
+				return nil, &jsonrpc.Error{
+					Code:    sdk.CodeUnsupportedProtocolVersion,
+					Message: "unsupported protocol version",
+					Data:    data,
+				}
+			}
 
-type serverInfo struct {
-	Name    string `json:"name"`
-	Version string `json:"version"`
-}
-
-type toolsListResult struct {
-	Tools []toolEntry `json:"tools"`
-}
-
-type toolEntry struct {
-	Name        string      `json:"name"`
-	Description string      `json:"description"`
-	InputSchema inputSchema `json:"inputSchema"`
-}
-
-type toolCallResult struct {
-	Content []contentBlock `json:"content"`
-	IsError bool           `json:"isError,omitempty"`
-}
-
-type contentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
-}
-
-type capabilityDoc struct {
-	Name     string `json:"name"`
-	Version  string `json:"version"`
-	Protocol string `json:"protocol"`
-}
-
-type emptyResult struct{}
-
-// ── JSON-RPC 2.0 wire types ───────────────────────────────────────────────────
-
-type rpcRequest struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id"` // string | number | null | absent
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params"`
-}
-
-type rpcResponse struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id"`
-	Result  any             `json:"result,omitempty"`
-	Error   *rpcError       `json:"error,omitempty"`
-}
-
-type rpcError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-// Standard JSON-RPC error codes.
-const (
-	codeParseError     = -32700
-	codeInvalidRequest = -32600
-	codeMethodNotFound = -32601
-	codeInvalidParams  = -32602
-	codeInternalError  = -32603
-)
-
-// ── HTTP handler ──────────────────────────────────────────────────────────────
-
-func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// MCP uses POST for all JSON-RPC messages.
-	// Allow OPTIONS for CORS pre-flight (agents may run cross-origin).
-	origin := s.resolveOrigin(r.Header.Get("Origin"))
-
-	switch r.Method {
-	case http.MethodOptions:
-		if !s.cfg.DisableCORS {
-			setCORSHeaders(w, origin)
+			result, err := next(ctx, method, req)
+			if discover, ok := result.(*sdk.DiscoverResult); ok {
+				discover.SupportedVersions = []string{ProtocolVersion}
+			}
+			return result, err
 		}
-		w.WriteHeader(http.StatusNoContent)
-		return
-	case http.MethodGet:
-		// Some clients ping the endpoint; return a minimal capability document.
-		if !s.cfg.DisableCORS {
-			setCORSHeaders(w, origin)
+	}
+}
+
+func requestHookMiddleware(hooks RequestHooks) sdk.Middleware {
+	return func(next sdk.MethodHandler) sdk.MethodHandler {
+		return func(ctx context.Context, method string, req sdk.Request) (result sdk.Result, err error) {
+			startedAt := time.Now()
+			if hooks.Start != nil {
+				if derived := hooks.Start(ctx, method, req); derived != nil {
+					ctx = derived
+				}
+			}
+			defer func() {
+				if hooks.Finish != nil {
+					hooks.Finish(ctx, RequestEvent{
+						Method:    method,
+						StartedAt: startedAt,
+						Duration:  time.Since(startedAt),
+						Err:       err,
+					})
+				}
+			}()
+			return next(ctx, method, req)
 		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		_, _ = w.Write(s.capabilityJSON)
-		return
-	case http.MethodPost:
-		// intentional fall-through
-	default:
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-		return
 	}
+}
 
-	if !s.cfg.DisableCORS {
-		setCORSHeaders(w, origin)
+func parseAllowedOrigins(origins []string) (map[string]struct{}, bool, error) {
+	allowed := make(map[string]struct{}, len(origins))
+	for _, origin := range origins {
+		if origin == "*" {
+			return allowed, true, nil
+		}
+		normalized, err := normalizeOrigin(origin)
+		if err != nil {
+			return nil, false, fmt.Errorf("mcp: invalid allowed origin %q: %w", origin, err)
+		}
+		allowed[normalized] = struct{}{}
 	}
+	return allowed, false, nil
+}
 
-	if s.cfg.AuthFunc != nil {
-		if err := s.cfg.AuthFunc(r); err != nil {
-			slog.Warn("MCP auth failure",
-				"remote", r.RemoteAddr,
-				"error", err.Error(),
-			)
+func normalizeOrigin(origin string) (string, error) {
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return "", err
+	}
+	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" ||
+		(parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
+		return "", errors.New("origin must contain only an http(s) scheme and host")
+	}
+	return strings.ToLower(parsed.Scheme + "://" + parsed.Host), nil
+}
+
+func withOriginPolicy(allowed map[string]struct{}, allowAny bool, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		normalized, err := normalizeOrigin(origin)
+		_, permitted := allowed[normalized]
+		if err != nil || (!allowAny && !permitted) {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+
+		w.Header().Add("Vary", "Origin")
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Mcp-Method, Mcp-Name, Mcp-Protocol-Version")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func withAuthentication(authenticate Authenticator, next http.Handler) http.Handler {
+	if authenticate == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, err := authenticate(r.Context(), r)
+		if err != nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-	}
-
-	// Cap the request body so a malicious or misconfigured agent cannot
-	// exhaust server memory. 1 MiB is generous for any JSON-RPC tool call.
-	const maxBodyBytes = 1 << 20 // 1 MiB
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
-
-	var req rpcRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, nil, codeParseError, "Parse error")
-		return
-	}
-	if req.JSONRPC != "2.0" {
-		writeError(w, req.ID, codeInvalidRequest, "Invalid JSON-RPC version")
-		return
-	}
-
-	// Notifications have no id — do not send a response body, just 204.
-	isNotification := req.ID == nil || string(req.ID) == "null"
-
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-
-	result, rErr := s.dispatch(ctx, req)
-
-	if isNotification {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	resp := rpcResponse{JSONRPC: "2.0", ID: req.ID}
-	if rErr != nil {
-		resp.Error = rErr
-	} else {
-		resp.Result = result
-	}
-	_ = json.NewEncoder(w).Encode(resp)
-}
-
-func (s *server) dispatch(ctx context.Context, req rpcRequest) (any, *rpcError) {
-	switch req.Method {
-	case "initialize":
-		return s.handleInitialize(req.Params)
-	case "initialized":
-		return nil, nil // notification, caller will 204
-	case "ping":
-		return &emptyResult{}, nil
-	case "tools/list":
-		return s.handleToolsList()
-	case "tools/call":
-		return s.handleToolsCall(ctx, req.Params)
-	default:
-		return nil, &rpcError{Code: codeMethodNotFound, Message: fmt.Sprintf("Method not found: %s", req.Method)}
-	}
-}
-
-// ── MCP method handlers ───────────────────────────────────────────────────────
-
-func (s *server) handleInitialize(_ json.RawMessage) (any, *rpcError) {
-	return &s.initResult, nil
-}
-
-func (s *server) handleToolsList() (any, *rpcError) {
-	return &s.listResult, nil
-}
-
-func (s *server) handleToolsCall(ctx context.Context, params json.RawMessage) (any, *rpcError) {
-	var p struct {
-		Name      string          `json:"name"`
-		Arguments json.RawMessage `json:"arguments"`
-	}
-	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, &rpcError{Code: codeInvalidRequest, Message: "Invalid tools/call params"}
-	}
-
-	td, ok := s.toolIndex[p.Name]
-	if !ok {
-		return nil, &rpcError{Code: codeMethodNotFound, Message: fmt.Sprintf("Tool not found: %s", p.Name)}
-	}
-	if p.Arguments == nil {
-		p.Arguments = json.RawMessage("{}")
-	}
-	// Strict-validate arguments against the declared input type before
-	// dispatching. Unknown fields and type mismatches are rejected here so
-	// tool handlers never see silently-dropped fields (a common source of
-	// subtle bugs when agents hallucinate parameter names). Tools with no
-	// declared Input (inputType == nil) skip validation to preserve backwards
-	// compatibility with schemaless handlers.
-	if td.inputType != nil {
-		instance := reflect.New(td.inputType).Interface()
-		dec := json.NewDecoder(bytes.NewReader(p.Arguments))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(instance); err != nil {
-			return nil, &rpcError{
-				Code:    codeInvalidParams,
-				Message: fmt.Sprintf("Invalid arguments for tool %q: %v", p.Name, err),
-			}
+		if ctx != nil {
+			r = r.WithContext(ctx)
 		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func withRequestTimeout(timeout time.Duration, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		defer cancel()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func withConcurrencyLimit(limit int, next http.Handler) http.Handler {
+	semaphore := make(chan struct{}, limit)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case semaphore <- struct{}{}:
+			defer func() { <-semaphore }()
+			next.ServeHTTP(w, r)
+		default:
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		}
+	})
+}
+
+type tokenBucket struct {
+	mu                sync.Mutex
+	requestsPerSecond float64
+	burst             float64
+	tokens            float64
+	last              time.Time
+}
+
+func newTokenBucket(cfg *RateLimitConfig) (*tokenBucket, error) {
+	if cfg == nil {
+		return nil, nil
 	}
-	result, err := td.tool.Handler(ctx, p.Arguments)
-	if err != nil {
-		return &toolCallResult{
-			Content: []contentBlock{{Type: "text", Text: err.Error()}},
-			IsError: true,
-		}, nil
+	if cfg.RequestsPerSecond <= 0 {
+		return nil, fmt.Errorf("mcp: RateLimit.RequestsPerSecond must be > 0, got %g", cfg.RequestsPerSecond)
 	}
-	b, merr := json.Marshal(result)
-	if merr != nil {
-		return nil, &rpcError{Code: codeInternalError, Message: "Failed to serialise tool result"}
+	if cfg.Burst <= 0 {
+		return nil, fmt.Errorf("mcp: RateLimit.Burst must be > 0, got %d", cfg.Burst)
 	}
-	return &toolCallResult{
-		Content: []contentBlock{{Type: "text", Text: string(b)}},
+	now := time.Now()
+	return &tokenBucket{
+		requestsPerSecond: cfg.RequestsPerSecond,
+		burst:             float64(cfg.Burst),
+		tokens:            float64(cfg.Burst),
+		last:              now,
 	}, nil
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+func (limiter *tokenBucket) allow(now time.Time) bool {
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
 
-// resolveOrigin returns the origin to echo in Access-Control-Allow-Origin.
-// If the allowed list is ["*"], it returns "*". Otherwise, it checks the
-// request origin against the allowed list and returns it only if it matches.
-func (s *server) resolveOrigin(reqOrigin string) string {
-	if len(s.allowedOrigins) == 1 && s.allowedOrigins[0] == "*" {
-		return "*"
+	elapsed := now.Sub(limiter.last).Seconds()
+	limiter.tokens = min(limiter.burst, limiter.tokens+elapsed*limiter.requestsPerSecond)
+	limiter.last = now
+	if limiter.tokens < 1 {
+		return false
 	}
-	for _, o := range s.allowedOrigins {
-		if strings.EqualFold(o, reqOrigin) {
-			return reqOrigin
+	limiter.tokens--
+	return true
+}
+
+func withRateLimit(limiter *tokenBucket, next http.Handler) http.Handler {
+	if limiter == nil {
+		return next
+	}
+	retryAfter := strconv.Itoa(max(1, int(math.Ceil(1/limiter.requestsPerSecond))))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !limiter.allow(time.Now()) {
+			w.Header().Set("Retry-After", retryAfter)
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			return
 		}
-	}
-	// No match — return the first allowed origin so the header is still set
-	// (browsers will block the request anyway).
-	return s.allowedOrigins[0]
+		next.ServeHTTP(w, r)
+	})
 }
 
-func setCORSHeaders(w http.ResponseWriter, origin string) {
-	w.Header().Set("Access-Control-Allow-Origin", origin)
-	if origin != "*" {
-		w.Header().Add("Vary", "Origin")
-	}
-	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
 }
 
-func writeError(w http.ResponseWriter, id json.RawMessage, code int, msg string) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	resp := rpcResponse{
-		JSONRPC: "2.0",
-		ID:      id,
-		Error:   &rpcError{Code: code, Message: msg},
+func (w *statusRecorder) WriteHeader(status int) {
+	if w.status != 0 {
+		return
 	}
-	_ = json.NewEncoder(w).Encode(resp)
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
 }
 
-// ── JSON Schema reflection ────────────────────────────────────────────────────
-
-// inputSchema is a minimal JSON Schema object sufficient for MCP tool inputs.
-type inputSchema struct {
-	Type       string                    `json:"type"`
-	Properties map[string]propertySchema `json:"properties,omitempty"`
-	Required   []string                  `json:"required,omitempty"`
+func (w *statusRecorder) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(data)
 }
 
-type propertySchema struct {
-	Type        string                    `json:"type"`
-	Description string                    `json:"description,omitempty"`
-	Items       *propertySchema           `json:"items,omitempty"`      // for array types
-	Properties  map[string]propertySchema `json:"properties,omitempty"` // for object types
+func (w *statusRecorder) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
-var timeType = reflect.TypeFor[time.Time]()
-
-func buildSchema(v any) inputSchema {
-	if v == nil {
-		return inputSchema{Type: "object"}
-	}
-	t := reflect.TypeOf(v)
-	for t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-	if t.Kind() != reflect.Struct {
-		return inputSchema{Type: "object"}
-	}
-
-	props := map[string]propertySchema{}
-	var required []string
-
-	for sf := range t.Fields() {
-		if !sf.IsExported() {
-			continue
+func withAudit(audit func(context.Context, HTTPAuditEvent), next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		startedAt := time.Now()
+		recorder := &statusRecorder{ResponseWriter: w}
+		next.ServeHTTP(recorder, r)
+		status := recorder.status
+		if status == 0 {
+			status = http.StatusOK
 		}
-		if sf.Anonymous {
-			// Inline embedded structs.
-			inner := buildSchema(reflect.New(sf.Type).Interface())
-			maps.Copy(props, inner.Properties)
-			required = append(required, inner.Required...)
-			continue
-		}
-
-		tag := sf.Tag.Get("json")
-		if tag == "-" {
-			continue
-		}
-		name, rest, _ := strings.Cut(tag, ",")
-		name = cmp.Or(name, sf.Name)
-		omitempty := strings.Contains(rest, "omitempty")
-
-		ft := sf.Type
-		isPtr := ft.Kind() == reflect.Pointer
-		if isPtr {
-			ft = ft.Elem()
-		}
-
-		desc := sf.Tag.Get("description")
-		ps := reflectProp(ft, desc)
-		props[name] = ps
-
-		if !isPtr && !omitempty {
-			required = append(required, name)
-		}
-	}
-
-	return inputSchema{
-		Type:       "object",
-		Properties: props,
-		Required:   required,
-	}
-}
-
-func reflectProp(t reflect.Type, desc string) propertySchema {
-	for t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-	if t == timeType {
-		return propertySchema{Type: "string", Description: coalesce(desc, "datetime (RFC 3339)")}
-	}
-	switch t.Kind() {
-	case reflect.String:
-		return propertySchema{Type: "string", Description: desc}
-	case reflect.Bool:
-		return propertySchema{Type: "boolean", Description: desc}
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return propertySchema{Type: "integer", Description: desc}
-	case reflect.Float32, reflect.Float64:
-		return propertySchema{Type: "number", Description: desc}
-	case reflect.Slice:
-		items := reflectProp(t.Elem(), "")
-		return propertySchema{Type: "array", Description: desc, Items: &items}
-	case reflect.Map:
-		return propertySchema{Type: "object", Description: desc}
-	case reflect.Struct:
-		// Nested object — recurse.
-		inner := buildSchema(reflect.New(t).Interface())
-		return propertySchema{Type: "object", Description: desc, Properties: inner.Properties}
-	default:
-		return propertySchema{Type: "string", Description: desc}
-	}
-}
-
-func coalesce(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
+		audit(r.Context(), HTTPAuditEvent{
+			StartedAt: startedAt,
+			Duration:  time.Since(startedAt),
+			Method:    r.Method,
+			Path:      r.URL.Path,
+			Remote:    r.RemoteAddr,
+			Status:    status,
+		})
+	})
 }

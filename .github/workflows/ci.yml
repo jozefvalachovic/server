@@ -22,13 +22,16 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.26"
+          go-version: "1.27"
 
       - name: Download dependencies
         run: go mod download
 
       - name: Verify dependencies
         run: go mod verify
+
+      - name: Check module tidiness
+        run: go mod tidy -diff
 
       - name: Check go fix
         run: |
@@ -43,7 +46,7 @@ jobs:
         run: go vet ./...
 
       - name: Run tests
-        run: go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v /example/)
+        run: go list ./... | grep -v /example/ | xargs go test -v -race -coverprofile=coverage.out
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
@@ -63,6 +66,49 @@ jobs:
             exit 1
           fi
 
+  mcp:
+    name: MCP
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mcp
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.27"
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Check module tidiness
+        run: go mod tidy -diff
+
+      - name: Check go fix
+        run: |
+          OUTPUT=$(go fix -diff ./... 2>&1)
+          if [ -n "$OUTPUT" ]; then
+            echo "$OUTPUT"
+            echo "::error::go fix found pending MCP modernizations - run 'cd mcp && GOWORK=off go fix ./...' locally"
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test -v -race ./...
+
+      - name: Build
+        run: go build -v ./...
+
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -74,14 +120,20 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.26"
+          go-version: "1.27"
 
       - name: Build
-        run: go build -v $(go list ./... | grep -v /example/)
+        run: go list ./... | grep -v /example/ | xargs go build -v
 
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - .
+          - mcp
 
     steps:
       - name: Checkout code
@@ -90,19 +142,20 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.26"
+          go-version: "1.27"
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
         with:
           version: v2.8.0
           install-mode: goinstall
+          working-directory: ${{ matrix.module }}
           args: --timeout=5m
 
   release:
     name: Release
     runs-on: ubuntu-latest
-    needs: [test, build, lint]
+    needs: [test, mcp, build, lint]
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
@@ -125,7 +178,7 @@ jobs:
   tag:
     name: Tag Version
     runs-on: ubuntu-latest
-    needs: [test, build, lint]
+    needs: [test, mcp, build, lint]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     permissions:
       contents: write
@@ -134,41 +187,31 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
-      - name: Extract version from version.go
-        id: version
+      - name: Extract module versions
+        id: versions
         run: |
-          VERSION=$(grep -oP 'const Version = "\K[^"]+' version.go)
-          if [ -z "$VERSION" ]; then
-            echo "::error::Could not extract version from version.go"
+          ROOT_VERSION=$(sed -n 's/^const Version = "\([^"]*\)"$/\1/p' version.go)
+          MCP_VERSION=$(sed -n 's/^const Version = "\([^"]*\)"$/\1/p' mcp/version.go)
+          if [ -z "$ROOT_VERSION" ] || [ -z "$MCP_VERSION" ]; then
+            echo "::error::Could not extract root and MCP module versions"
             exit 1
           fi
-          TAG="v${VERSION}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Detected version: $TAG"
+          echo "root_tag=v${ROOT_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "mcp_tag=mcp/v${MCP_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Detected versions: root v${ROOT_VERSION}, MCP mcp/v${MCP_VERSION}"
 
-      - name: Check if tag already exists
-        id: check
+      - name: Create and push missing tags
         env:
-          TAG: ${{ steps.version.outputs.tag }}
-        run: |
-          if git ls-remote --tags origin "refs/tags/$TAG" | grep -q "$TAG"; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Tag $TAG already exists — will replace."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Delete existing tag
-        if: steps.check.outputs.exists == 'true'
-        env:
-          TAG: ${{ steps.version.outputs.tag }}
-        run: git push origin ":refs/tags/$TAG"
-
-      - name: Create and push tag
-        env:
-          TAG: ${{ steps.version.outputs.tag }}
+          ROOT_TAG: ${{ steps.versions.outputs.root_tag }}
+          MCP_TAG: ${{ steps.versions.outputs.mcp_tag }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "Release $TAG"
-          git push origin "$TAG"
+          for TAG in "$ROOT_TAG" "$MCP_TAG"; do
+            if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+              echo "Tag $TAG already exists; leaving it unchanged."
+              continue
+            fi
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+          done

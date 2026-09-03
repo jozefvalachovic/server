@@ -3,6 +3,7 @@ package response
 import (
 	"encoding/hex"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"hash/fnv"
 	"net/http"
 	"strings"
@@ -180,7 +181,7 @@ func APIResponseWriterWithETag[T any](w http.ResponseWriter, r *http.Request, da
 		Data: responseData,
 	}
 
-	body, err := json.Marshal(response)
+	body, err := jsonv2.Marshal(&response, json.DefaultOptionsV1(), jsonv2.Deterministic(true))
 	if err != nil {
 		logger.LogError("Failed to encode API response for ETag", "error", err.Error())
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)

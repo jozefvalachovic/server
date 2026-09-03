@@ -83,9 +83,10 @@ type CertReloader struct {
 	certModTime time.Time
 	keyModTime  time.Time
 
-	stop chan struct{}
-	done chan struct{}
-	log  logger.Logger
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
+	log      logger.Logger
 }
 
 // NewCertReloader loads the initial certificate and starts a background
@@ -155,12 +156,10 @@ func (r *CertReloader) GetCertificate(_ *tls.ClientHelloInfo) (*tls.Certificate,
 
 // Stop terminates the background poll goroutine and waits for it to exit.
 func (r *CertReloader) Stop() {
-	select {
-	case <-r.stop:
-		return // already stopped
-	default:
-		close(r.stop)
+	if r == nil {
+		return
 	}
+	r.stopOnce.Do(func() { close(r.stop) })
 	<-r.done
 }
 

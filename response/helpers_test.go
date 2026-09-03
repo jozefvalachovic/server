@@ -88,6 +88,42 @@ func TestValidateAndDecode_ExtraFieldsRejected(t *testing.T) {
 	}
 }
 
+func TestValidateAndDecode_DuplicateFieldsRejected(t *testing.T) {
+	type payload struct {
+		Name string `json:"name"`
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"name":"first","name":"second"}`))
+	_, apiErr := ValidateAndDecode[payload](req)
+	if apiErr == nil {
+		t.Fatal("expected duplicate field error")
+	}
+}
+
+func TestValidateAndDecode_FieldNamesAreCaseSensitive(t *testing.T) {
+	type payload struct {
+		Name string `json:"name"`
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"Name":"alice"}`))
+	_, apiErr := ValidateAndDecode[payload](req)
+	if apiErr == nil {
+		t.Fatal("expected case-mismatched field error")
+	}
+}
+
+func TestValidateAndDecode_TrailingValueRejected(t *testing.T) {
+	type payload struct {
+		Name string `json:"name"`
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"name":"alice"} {"name":"bob"}`))
+	_, apiErr := ValidateAndDecode[payload](req)
+	if apiErr == nil {
+		t.Fatal("expected trailing JSON value error")
+	}
+}
+
 func TestCreateEmptyData_SliceIsNotNil(t *testing.T) {
 	result := CreateEmptyData[[]string]()
 	if result == nil {

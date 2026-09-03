@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/jozefvalachovic/server/client"
-	"github.com/jozefvalachovic/server/mcp"
 	"github.com/jozefvalachovic/server/middleware"
 	"github.com/jozefvalachovic/server/routes"
 	"github.com/jozefvalachovic/server/server"
@@ -210,14 +209,6 @@ func main() {
 		},
 	})
 
-	// ── MCP tool server at /mcp ───────────────────────────────────────────
-	routes.RegisterMCP(mux, "/mcp", mcp.Config{
-		Name:           "example-server",
-		Version:        "1.0.0",
-		Tools:          mcpTools(),
-		AllowedOrigins: []string{"http://localhost:3000", "https://example.com"},
-	})
-
 	// ── HTTP server ────────────────────────────────────────────────────────
 	// Build admin config separately so we don't store a typed-nil interface
 	// (which would compare != nil and panic inside the admin package).
@@ -318,7 +309,6 @@ func main() {
 	fmt.Printf("  GET    http://%s:%s/healthz        liveness probe\n", host, port)
 	fmt.Printf("  GET    http://%s:%s/readyz         readiness probe (dep checks)\n", host, port)
 	fmt.Printf("  GET    http://%s:%s/docs           swagger UI\n", host, port)
-	fmt.Printf("  POST   http://%s:%s/mcp            MCP tool server (JSON-RPC 2.0)\n", host, port)
 	fmt.Printf("  GET    http://%s:%s/metrics/       admin metrics UI (ADMIN_NAME + ADMIN_SECRET + ADMIN_SIGNING_KEY)\n", host, port)
 	fmt.Printf("  GET    http://%s:%s/cache/         admin cache UI  (ADMIN_NAME + ADMIN_SECRET + ADMIN_SIGNING_KEY)\n\n", host, port)
 

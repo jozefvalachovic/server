@@ -8,12 +8,10 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/jozefvalachovic/server/cache"
-	"github.com/jozefvalachovic/server/mcp"
 	"github.com/jozefvalachovic/server/middleware"
 	"github.com/jozefvalachovic/server/request"
 	"github.com/jozefvalachovic/server/response"
@@ -463,81 +461,4 @@ func fetchDemo(w http.ResponseWriter, r *http.Request) {
 		Status:   resp.StatusCode,
 		Response: result,
 	}, http.StatusOK)
-}
-
-// ── MCP tools ─────────────────────────────────────────────────────────────
-
-// GetProductInput is the typed input for the "get_product" MCP tool.
-type GetProductInput struct {
-	ID int `json:"id" description:"The numeric product ID to fetch."`
-}
-
-// SearchProductsInput is the typed input for the "search_products" MCP tool.
-type SearchProductsInput struct {
-	Query string `json:"query" description:"Case-insensitive substring to match against product name or description."`
-}
-
-// mcpTools returns the MCP tool definitions for the example server.
-// Each Tool.Handler re-uses the same in-memory store as the HTTP handlers.
-func mcpTools() []mcp.Tool {
-	tools := []mcp.Tool{
-		{
-			Name:        "list_products",
-			Description: "Return the full list of products.",
-			Handler: func(_ context.Context, _ json.RawMessage) (any, error) {
-				mu.RLock()
-				all := make([]Product, len(products))
-				copy(all, products)
-				mu.RUnlock()
-				return all, nil
-			},
-		},
-		{
-			Name:        "get_product",
-			Description: "Fetch a single product by its numeric ID. Returns an error when not found.",
-			Input:       (*GetProductInput)(nil),
-			Handler: func(_ context.Context, raw json.RawMessage) (any, error) {
-				var in GetProductInput
-				if err := json.Unmarshal(raw, &in); err != nil {
-					return nil, err
-				}
-				mu.RLock()
-				defer mu.RUnlock()
-				for _, p := range products {
-					if p.ID == in.ID {
-						return p, nil
-					}
-				}
-				return nil, fmt.Errorf("product %d not found", in.ID)
-			},
-		},
-		{
-			Name:        "search_products",
-			Description: "Search products by name or description (case-insensitive substring match).",
-			Input:       (*SearchProductsInput)(nil),
-			Handler: func(_ context.Context, raw json.RawMessage) (any, error) {
-				var in SearchProductsInput
-				if err := json.Unmarshal(raw, &in); err != nil {
-					return nil, err
-				}
-				q := strings.ToLower(in.Query)
-				mu.RLock()
-				source := make([]Product, len(products))
-				copy(source, products)
-				mu.RUnlock()
-				var matched []Product
-				for _, p := range source {
-					if strings.Contains(strings.ToLower(p.Name), q) ||
-						strings.Contains(strings.ToLower(p.Description), q) {
-						matched = append(matched, p)
-					}
-				}
-				if matched == nil {
-					matched = []Product{}
-				}
-				return matched, nil
-			},
-		},
-	}
-	return tools
 }

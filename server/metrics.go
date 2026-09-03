@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"strconv"
 	"time"
@@ -20,6 +21,10 @@ import (
 // consistent with how HTTP_PORT and TCP_PORT are resolved for the main servers.
 type MetricsServerConfig struct {
 	Handler http.Handler
+	// EnablePprof exposes the standard /debug/pprof/ endpoints on the metrics
+	// server, including Go 1.27's goroutineleak profile. It is disabled by
+	// default and should only be enabled on a restricted listener.
+	EnablePprof bool
 	// TLSConfig enables TLS on the metrics server. When set, the server reads
 	// METRICS_TLS_CERT_PATH and METRICS_TLS_KEY_PATH from the environment.
 	// nil disables TLS (default).
@@ -36,6 +41,13 @@ type MetricsServer struct {
 // METRICS_HOST controls the bind address; defaults to 127.0.0.1 so metrics
 // are never exposed on public interfaces without an explicit override.
 func StartMetricsServer(cfg *MetricsServerConfig) (*MetricsServer, error) {
+	if cfg == nil {
+		return nil, errors.New("MetricsServerConfig must not be nil")
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid MetricsServerConfig: %w", err)
+	}
+
 	port := os.Getenv("METRICS_PORT")
 	portNum, portErr := strconv.Atoi(port)
 	if portErr != nil || portNum < 1 || portNum > 65535 {
@@ -70,6 +82,13 @@ func StartMetricsServer(cfg *MetricsServerConfig) (*MetricsServer, error) {
 	//                      internals on its own route.
 	mux.Handle("/metrics", cfg.Handler)
 	mux.Handle("/logger-metrics", logger.MetricsHandler())
+	if cfg.EnablePprof {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		if _, err := w.Write([]byte("ok")); err != nil {
@@ -78,7 +97,7 @@ func StartMetricsServer(cfg *MetricsServerConfig) (*MetricsServer, error) {
 	})
 
 	server := &http.Server{
-		Addr:              host + ":" + port,
+		Addr:              net.JoinHostPort(host, port),
 		Handler:           mux,
 		TLSConfig:         cfg.TLSConfig,
 		ReadHeaderTimeout: 5 * time.Second, // guard against slow-header attacks
@@ -87,15 +106,36 @@ func StartMetricsServer(cfg *MetricsServerConfig) (*MetricsServer, error) {
 		WriteTimeout:      15 * time.Second,
 	}
 
+	listener, err := net.Listen("tcp", server.Addr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to bind metrics listener: %w", err)
+	}
+
+	if cfg.TLSConfig != nil {
+		certFile := os.Getenv("METRICS_TLS_CERT_PATH")
+		keyFile := os.Getenv("METRICS_TLS_KEY_PATH")
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			_ = listener.Close()
+			return nil, fmt.Errorf("failed to load metrics TLS certificate: %w", err)
+		}
+		tlsConfig := cfg.TLSConfig.Clone()
+		tlsConfig.Certificates = []tls.Certificate{cert}
+		server.TLSConfig = tlsConfig
+	}
+
 	go func() {
-		logger.LogInfo("Metrics server starting", "port", port)
+		defer func() {
+			if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				logger.LogWarn("Metrics listener close error", "error", err.Error())
+			}
+		}()
+		logger.LogInfo("Metrics server starting", "address", server.Addr)
 		var serveErr error
 		if cfg.TLSConfig != nil {
-			certFile := os.Getenv("METRICS_TLS_CERT_PATH")
-			keyFile := os.Getenv("METRICS_TLS_KEY_PATH")
-			serveErr = server.ListenAndServeTLS(certFile, keyFile)
+			serveErr = server.ServeTLS(listener, "", "")
 		} else {
-			serveErr = server.ListenAndServe()
+			serveErr = server.Serve(listener)
 		}
 		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			logger.LogError("Metrics server error", "error", serveErr.Error())

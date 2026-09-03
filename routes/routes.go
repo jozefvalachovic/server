@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	"github.com/jozefvalachovic/server/cache"
-	"github.com/jozefvalachovic/server/mcp"
 	"github.com/jozefvalachovic/server/middleware"
 	"github.com/jozefvalachovic/server/response"
 	"github.com/jozefvalachovic/server/swagger"
@@ -194,22 +193,6 @@ func RegisterSwagger(mux *http.ServeMux, path string, cfg swagger.Config) {
 	})
 }
 
-// RegisterMCP mounts an MCP (Model Context Protocol) tool server at the given
-// path (e.g. "/mcp"). Agents discover and call tools via JSON-RPC 2.0 POST
-// requests to that endpoint following the MCP 2024-11-05 specification.
-//
-// CORS: mcp.Handler manages its own CORS headers. If the server-wide
-// middleware.CORS layer is also enabled (the default when
-// HTTPServerConfig.CORS is set), both layers would write Access-Control-*
-// headers for this path, producing duplicated or conflicting values that
-// browsers reject. To avoid this, either set mcp.Config.DisableCORS = true
-// (letting the outer middleware own CORS) or align AllowedOrigins in both
-// layers. Prefer DisableCORS when the endpoint sits behind the shared stack.
-func RegisterMCP(mux *http.ServeMux, path string, cfg mcp.Config) {
-	path = strings.TrimRight(path, "/")
-	mux.Handle(path, mcp.Handler(cfg))
-}
-
 type Routes map[string]http.HandlerFunc
 
 // RouteHandler provides automatic 405 Method Not Allowed responses.
@@ -260,8 +243,8 @@ func RegisterRouteList(mux *http.ServeMux, routes []Route) {
 	for _, route := range routes {
 		handler := http.Handler(route.Handler)
 		// Apply middlewares: index 0 is outermost (first to execute per request).
-		for i := len(route.Middlewares) - 1; i >= 0; i-- {
-			handler = route.Middlewares[i](handler)
+		for _, middleware := range slices.Backward(route.Middlewares) {
+			handler = middleware(handler)
 		}
 		if grouped[route.Path] == nil {
 			grouped[route.Path] = make(Routes)

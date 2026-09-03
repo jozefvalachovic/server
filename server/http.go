@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -304,6 +305,9 @@ type HTTPServerConfig struct {
 	// read. Default: 1 MiB (1 << 20). Override for APIs that use very large
 	// JWTs or need a tighter security boundary.
 	MaxHeaderBytes int
+	// MaxHeaderValueCount limits the total number of HTTP header values in a
+	// request. 0 uses net/http.DefaultMaxHeaderValueCount.
+	MaxHeaderValueCount int
 	// BaseContext optionally provides a base context for all requests.
 	// When non-nil, this function is called once when the server starts and
 	// the returned context becomes the root context for every request.
@@ -522,8 +526,8 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 
 	stack = append(stack, cfg.Middlewares...)
 
-	for i := len(stack) - 1; i >= 0; i-- {
-		handler = stack[i](handler)
+	for _, middleware := range slices.Backward(stack) {
+		handler = middleware(handler)
 	}
 
 	// Logging is always the true outermost layer.
@@ -599,14 +603,15 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 	}
 
 	srv := &http.Server{
-		Addr:              host + ":" + port,
-		TLSConfig:         cfg.TLSConfig,
-		Handler:           handler,
-		IdleTimeout:       config.HTTPIdleTimeout,
-		ReadHeaderTimeout: readHeaderTimeout,
-		MaxHeaderBytes:    cmp.Or(cfg.MaxHeaderBytes, 1<<20), // 1 MiB default
-		ReadTimeout:       readTimeout,
-		WriteTimeout:      writeTimeout,
+		Addr:                net.JoinHostPort(host, port),
+		TLSConfig:           cfg.TLSConfig,
+		Handler:             handler,
+		IdleTimeout:         config.HTTPIdleTimeout,
+		ReadHeaderTimeout:   readHeaderTimeout,
+		MaxHeaderBytes:      cmp.Or(cfg.MaxHeaderBytes, 1<<20), // 1 MiB default
+		MaxHeaderValueCount: cfg.MaxHeaderValueCount,
+		ReadTimeout:         readTimeout,
+		WriteTimeout:        writeTimeout,
 	}
 
 	// Wire optional BaseContext / ConnContext hooks so callers can inject
@@ -661,6 +666,22 @@ func (as *HTTPServer) Start() error {
 		}
 		return fmt.Errorf("failed to bind listener: %w", err)
 	}
+	if as.tlsConfig != nil && as.certReloader == nil {
+		cert, err := tls.LoadX509KeyPair(as.certFile, as.keyFile)
+		if err != nil {
+			_ = ln.Close()
+			if as.metricsServer != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_ = as.metricsServer.Shutdown(ctx)
+				cancel()
+				as.metricsServer = nil
+			}
+			return fmt.Errorf("failed to load HTTP TLS certificate: %w", err)
+		}
+		tlsConfig := as.tlsConfig.Clone()
+		tlsConfig.Certificates = []tls.Certificate{cert}
+		as.server.TLSConfig = tlsConfig
+	}
 	if as.maxConns > 0 {
 		ln = newLimitedListener(ln, as.maxConns)
 	}
@@ -680,7 +701,7 @@ func (as *HTTPServer) Start() error {
 		as.log.LogInfo("Server starting", "port", as.port)
 		var serveErr error
 		if as.tlsConfig != nil {
-			serveErr = as.server.ServeTLS(ln, as.certFile, as.keyFile)
+			serveErr = as.server.ServeTLS(ln, "", "")
 		} else {
 			serveErr = as.server.Serve(ln)
 		}

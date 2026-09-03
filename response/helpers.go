@@ -1,7 +1,7 @@
 package response
 
 import (
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"io"
 	"net/http"
@@ -20,9 +20,7 @@ func ValidateAndDecode[T any](r *http.Request) (T, *APIError[T]) {
 		}
 	}
 
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&obj); err != nil {
+	if err := jsonv2.UnmarshalRead(r.Body, &obj, jsonv2.RejectUnknownMembers(true)); err != nil {
 		if errors.Is(err, io.EOF) {
 			return obj, &APIError[T]{
 				Code:    http.StatusBadRequest,

@@ -163,6 +163,9 @@ func (h *HealthChecker) Result(ctx context.Context) HealthCheckResult {
 		detail checkDetail
 	}
 
+	resultCtx, cancel := context.WithTimeout(ctx, h.timeout)
+	defer cancel()
+	resultStart := time.Now()
 	ch := make(chan entry, len(checks))
 	for name, fn := range checks {
 		go func(name string, fn CheckFunc) {
@@ -181,11 +184,11 @@ func (h *HealthChecker) Result(ctx context.Context) HealthCheckResult {
 				}
 			}()
 
-			ctx2, cancel := context.WithTimeout(ctx, h.timeout)
-			defer cancel()
-
-			err := fn(ctx2)
+			err := fn(resultCtx)
 			latency := time.Since(start)
+			if err == nil && resultCtx.Err() != nil {
+				err = resultCtx.Err()
+			}
 
 			d := checkDetail{
 				Status:  HealthStatusOK,
@@ -200,6 +203,10 @@ func (h *HealthChecker) Result(ctx context.Context) HealthCheckResult {
 	}
 
 	details := make(map[string]checkDetail, len(checks))
+	pending := make(map[string]struct{}, len(checks))
+	for name := range checks {
+		pending[name] = struct{}{}
+	}
 	anyDown := false
 	anyCriticalDown := false
 	// allDown starts true when there are registered checks and flips false
@@ -208,16 +215,36 @@ func (h *HealthChecker) Result(ctx context.Context) HealthCheckResult {
 	// HealthStatusOK — which is the desired behaviour: no registered checks
 	// means "nothing to report" → healthy.
 	allDown := len(checks) > 0
-	for range checks {
-		e := <-ch
-		details[e.name] = e.detail
-		if e.detail.Status == HealthStatusDown {
-			anyDown = true
-			if _, isCritical := criticalSet[e.name]; isCritical {
-				anyCriticalDown = true
+	for len(pending) > 0 {
+		select {
+		case e := <-ch:
+			if _, ok := pending[e.name]; !ok {
+				continue
 			}
-		} else {
-			allDown = false
+			delete(pending, e.name)
+			details[e.name] = e.detail
+			if e.detail.Status == HealthStatusDown {
+				anyDown = true
+				if _, isCritical := criticalSet[e.name]; isCritical {
+					anyCriticalDown = true
+				}
+			} else {
+				allDown = false
+			}
+		case <-resultCtx.Done():
+			latency := time.Since(resultStart).Round(time.Millisecond).String()
+			for name := range pending {
+				details[name] = checkDetail{
+					Status:  HealthStatusDown,
+					Error:   resultCtx.Err().Error(),
+					Latency: latency,
+				}
+				anyDown = true
+				if _, isCritical := criticalSet[name]; isCritical {
+					anyCriticalDown = true
+				}
+				delete(pending, name)
+			}
 		}
 	}
 
