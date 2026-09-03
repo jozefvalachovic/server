@@ -531,6 +531,11 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 		loggerMiddleware.WithLogBodyOnErrors(true),
 		loggerMiddleware.WithRequestID(true),
 		loggerMiddleware.WithMetrics(true),
+		// Skip common health check paths from logging.
+		loggerMiddleware.WithSkipPaths(
+			"/health", "/healthcheck", // Common health check paths
+			"/healthz", "/readyz", "/ready", "/livez", "/live", // Kubernetes check paths
+		),
 	}
 
 	// Inject app identity into every access log entry when known.
