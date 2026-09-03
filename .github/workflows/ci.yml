@@ -147,7 +147,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
         with:
-          version: v2.8.0
+          version: v2.13.2
           install-mode: goinstall
           working-directory: ${{ matrix.module }}
           args: --timeout=5m
