@@ -240,6 +240,12 @@ type HTTPServerConfig struct {
 
 	// --- Observability ---
 
+	// LogRequestBodyOnErrors buffers request bodies and writes them to the access
+	// log when a request fails with 4xx/5xx. Off by default: bodies may carry
+	// personal data or model prompts that must not reach logs. Bodies larger than
+	// logger MaxBodySize are logged without key-level redaction.
+	LogRequestBodyOnErrors bool
+
 	// MetricsServerConfig starts an embedded metrics server (e.g. Prometheus).
 	// nil disables the metrics server.
 	MetricsServerConfig *MetricsServerConfig
@@ -532,7 +538,7 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 
 	// Logging is always the true outermost layer.
 	logOpts := []loggerMiddleware.HTTPMiddlewareOption{
-		loggerMiddleware.WithLogBodyOnErrors(true),
+		loggerMiddleware.WithLogBodyOnErrors(cfg.LogRequestBodyOnErrors),
 		loggerMiddleware.WithRequestID(true),
 		loggerMiddleware.WithMetrics(true),
 		// Skip common health check paths from logging.

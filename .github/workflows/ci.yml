@@ -176,7 +176,7 @@ jobs:
             --generate-notes
 
   tag:
-    name: Tag Version
+    name: Publish Versions
     runs-on: ubuntu-latest
     needs: [test, mcp, build, lint]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -200,8 +200,9 @@ jobs:
           echo "mcp_tag=mcp/v${MCP_VERSION}" >> "$GITHUB_OUTPUT"
           echo "Detected versions: root v${ROOT_VERSION}, MCP mcp/v${MCP_VERSION}"
 
-      - name: Create and push missing tags
+      - name: Create tags and GitHub releases
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ROOT_TAG: ${{ steps.versions.outputs.root_tag }}
           MCP_TAG: ${{ steps.versions.outputs.mcp_tag }}
         run: |
@@ -210,8 +211,21 @@ jobs:
           for TAG in "$ROOT_TAG" "$MCP_TAG"; do
             if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
               echo "Tag $TAG already exists; leaving it unchanged."
-              continue
+            else
+              git tag -a "$TAG" -m "Release $TAG"
+              git push origin "$TAG"
             fi
-            git tag -a "$TAG" -m "Release $TAG"
-            git push origin "$TAG"
+
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "GitHub Release $TAG already exists; leaving it unchanged."
+            elif [ "$TAG" = "$ROOT_TAG" ]; then
+              gh release create "$TAG" \
+                --title "Release $TAG" \
+                --generate-notes \
+                --notes "Request-body logging on 4xx/5xx is now opt-in via HTTPServerConfig.LogRequestBodyOnErrors. Workloads that relied on failed-request body logging must set it to true."
+            else
+              gh release create "$TAG" \
+                --title "Release $TAG" \
+                --generate-notes
+            fi
           done

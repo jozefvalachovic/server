@@ -166,6 +166,7 @@ srv, err := server.NewHTTPServer(mux, "app", "1.0.0", server.HTTPServerConfig{
     Compress:     &server.CompressConfig{Enabled: true},
     Admin:        &server.AdminConfig{AppName: "app", AppVersion: "1.0.0", Store: store},
     AuditConfig:  &server.HTTPAuditConfig{Enabled: true, Methods: []string{"POST", "PUT", "DELETE"}},
+    LogRequestBodyOnErrors: false, // opt in only for payloads safe to persist in logs
     OTelBridge:   &server.OTelBridgeConfig{ServiceName: "app", ServiceVersion: "1.0.0"},
     MetricsServerConfig: &server.MetricsServerConfig{Handler: promHandler},
     BaseContext:  func(net.Listener) context.Context { return baseCtx },
@@ -176,30 +177,36 @@ srv, err := server.NewHTTPServer(mux, "app", "1.0.0", server.HTTPServerConfig{
 
 **`HTTPServerConfig` fields:**
 
-| Field                 | Type                                              | Default                | Description                                                            |
-| --------------------- | ------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------- |
-| `TLSConfig`           | `*tls.Config`                                     | nil (plain HTTP)       | TLS configuration; requires `HTTP_TLS_CERT_PATH` / `HTTP_TLS_KEY_PATH` |
-| `AutoCertReload`      | `bool`                                            | false                  | Poll cert/key files and hot-swap without restart                       |
-| `CertReloadInterval`  | `time.Duration`                                   | 30 s                   | Polling interval for cert file changes                                 |
-| `ReadTimeout`         | `time.Duration`                                   | 30 s                   | Max duration for reading the entire request                            |
-| `WriteTimeout`        | `time.Duration`                                   | 60 s                   | Max duration for writing the response                                  |
-| `MaxConns`            | `int`                                             | 0 (unlimited)          | Max concurrent HTTP connections via listener semaphore                 |
-| `MaxHeaderBytes`      | `int`                                             | 1 MiB                  | Max size of request headers                                            |
-| `MaxHeaderValueCount` | `int`                                             | net/http default       | Max total header values per request; 0 uses the standard-library limit |
-| `MetricsServerConfig` | `*MetricsServerConfig`                            | nil                    | Embedded metrics sidecar (e.g. Prometheus)                             |
-| `AuditConfig`         | `*HTTPAuditConfig`                                | nil                    | Structured audit logging per request                                   |
-| `OTelBridge`          | `*OTelBridgeConfig`                               | nil                    | OpenTelemetry log bridge (service.name + level mapping)                |
-| `RateLimitConfig`     | `*HTTPRateLimitConfig`                            | nil                    | Per-client token-bucket rate limiting                                  |
-| `CORS`                | `*CORSConfig`                                     | nil (disabled)         | Cross-Origin Resource Sharing headers                                  |
-| `RequestID`           | `*RequestIDConfig`                                | defaults enabled       | Request-ID injection/propagation                                       |
-| `TraceContext`        | `*TraceContextConfig`                             | defaults enabled       | W3C traceparent / tracestate propagation                               |
-| `Timeout`             | `*TimeoutConfig`                                  | 30 s default           | Per-request handler timeout; set `Timeout: 0` to disable               |
-| `IPFilter`            | `*IPFilterConfig`                                 | nil (allow all)        | IP allowlist/blocklist enforcement                                     |
-| `Compress`            | `*CompressConfig`                                 | nil (disabled)         | gzip response compression (must set `Enabled: true`)                   |
-| `Admin`               | `*AdminConfig`                                    | nil                    | Admin UI (metrics + cache explorer)                                    |
-| `BaseContext`         | `func(net.Listener) context.Context`              | `context.Background()` | Base context for all requests                                          |
-| `ConnContext`         | `func(context.Context, net.Conn) context.Context` | nil                    | Per-connection context modifier                                        |
-| `Middlewares`         | `[]HTTPMiddleware`                                | nil                    | Additional middleware applied after the built-in stack                 |
+| Field                    | Type                                              | Default                | Description                                                            |
+| ------------------------ | ------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------- |
+| `TLSConfig`              | `*tls.Config`                                     | nil (plain HTTP)       | TLS configuration; requires `HTTP_TLS_CERT_PATH` / `HTTP_TLS_KEY_PATH` |
+| `AutoCertReload`         | `bool`                                            | false                  | Poll cert/key files and hot-swap without restart                       |
+| `CertReloadInterval`     | `time.Duration`                                   | 30 s                   | Polling interval for cert file changes                                 |
+| `ReadTimeout`            | `time.Duration`                                   | 30 s                   | Max duration for reading the entire request                            |
+| `WriteTimeout`           | `time.Duration`                                   | 60 s                   | Max duration for writing the response                                  |
+| `MaxConns`               | `int`                                             | 0 (unlimited)          | Max concurrent HTTP connections via listener semaphore                 |
+| `MaxHeaderBytes`         | `int`                                             | 1 MiB                  | Max size of request headers                                            |
+| `MaxHeaderValueCount`    | `int`                                             | net/http default       | Max total header values per request; 0 uses the standard-library limit |
+| `MetricsServerConfig`    | `*MetricsServerConfig`                            | nil                    | Embedded metrics sidecar (e.g. Prometheus)                             |
+| `AuditConfig`            | `*HTTPAuditConfig`                                | nil                    | Structured audit logging per request                                   |
+| `LogRequestBodyOnErrors` | `bool`                                            | false                  | Buffer and log request bodies for 4xx/5xx responses                    |
+| `OTelBridge`             | `*OTelBridgeConfig`                               | nil                    | OpenTelemetry log bridge (service.name + level mapping)                |
+| `RateLimitConfig`        | `*HTTPRateLimitConfig`                            | nil                    | Per-client token-bucket rate limiting                                  |
+| `CORS`                   | `*CORSConfig`                                     | nil (disabled)         | Cross-Origin Resource Sharing headers                                  |
+| `RequestID`              | `*RequestIDConfig`                                | defaults enabled       | Request-ID injection/propagation                                       |
+| `TraceContext`           | `*TraceContextConfig`                             | defaults enabled       | W3C traceparent / tracestate propagation                               |
+| `Timeout`                | `*TimeoutConfig`                                  | 30 s default           | Per-request handler timeout; set `Timeout: 0` to disable               |
+| `IPFilter`               | `*IPFilterConfig`                                 | nil (allow all)        | IP allowlist/blocklist enforcement                                     |
+| `Compress`               | `*CompressConfig`                                 | nil (disabled)         | gzip response compression (must set `Enabled: true`)                   |
+| `Admin`                  | `*AdminConfig`                                    | nil                    | Admin UI (metrics + cache explorer)                                    |
+| `BaseContext`            | `func(net.Listener) context.Context`              | `context.Background()` | Base context for all requests                                          |
+| `ConnContext`            | `func(context.Context, net.Conn) context.Context` | nil                    | Per-connection context modifier                                        |
+| `Middlewares`            | `[]HTTPMiddleware`                                | nil                    | Additional middleware applied after the built-in stack                 |
+
+> **v1.3.1 behavior change:** Request-body logging on 4xx/5xx is now opt-in via
+> `HTTPServerConfig.LogRequestBodyOnErrors`. Workloads that relied on
+> failed-request body logging must set it to `true`. Leave it disabled for
+> requests that may contain personal data, credentials, or model prompts.
 
 **`HTTPAuditConfig`** — controls structured audit event emission:
 
