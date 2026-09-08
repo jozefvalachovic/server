@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -248,6 +249,19 @@ type HTTPServerConfig struct {
 	// MaxBodySize are logged as a raw truncated string without key-level
 	// redaction.
 	LogRequestBodyOnErrors bool
+
+	// LogLevels overrides the access-log level per HTTP status code. Keys may be
+	// an exact status (401) or a status class (400 for all 4xx); exact wins over
+	// class. Unset statuses keep the logger defaults: 5xx Error, 4xx Warn,
+	// otherwise Info. The map is copied at construction; later mutation by the
+	// caller has no effect.
+	//
+	// Example — treat routine 401 probes as informational on an auth service:
+	//
+	//	LogLevels: map[int]logger.LogLevel{
+	//		http.StatusUnauthorized: logger.Info,
+	//	}
+	LogLevels map[int]logger.LogLevel
 
 	// MetricsServerConfig starts an embedded metrics server (e.g. Prometheus).
 	// nil disables the metrics server.
@@ -544,6 +558,13 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 		loggerMiddleware.WithLogBodyOnErrors(cfg.LogRequestBodyOnErrors),
 		loggerMiddleware.WithRequestID(true),
 		loggerMiddleware.WithMetrics(true),
+	}
+
+	// Per-status access-log level overrides. WithLogLevels assigns the map by
+	// reference (replace, not merge — same shape as WithSkipPaths), so clone
+	// the caller's map to keep later mutation from changing logging at runtime.
+	if len(cfg.LogLevels) > 0 {
+		logOpts = append(logOpts, loggerMiddleware.WithLogLevels(maps.Clone(cfg.LogLevels)))
 	}
 
 	// Inject app identity into every access log entry when known.

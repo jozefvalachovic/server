@@ -39,6 +39,13 @@ func (c *HTTPServerConfig) Validate() error {
 	if c.Timeout != nil && c.Timeout.Timeout < 0 {
 		errs = append(errs, fmt.Errorf("Timeout.Timeout must be >= 0, got %s", c.Timeout.Timeout))
 	}
+	for status := range c.LogLevels {
+		// Exact statuses (e.g. 401) and class keys (100, 200, …, 500) are both
+		// valid; anything outside 100–599 can never match a response status.
+		if status < 100 || status > 599 {
+			errs = append(errs, fmt.Errorf("LogLevels key %d is not a valid HTTP status or status class (100–599)", status))
+		}
+	}
 	if c.RateLimitConfig != nil {
 		if c.RateLimitConfig.RequestsPerSecond <= 0 {
 			errs = append(errs, fmt.Errorf("RateLimitConfig.RequestsPerSecond must be > 0, got %f", c.RateLimitConfig.RequestsPerSecond))

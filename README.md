@@ -167,6 +167,7 @@ srv, err := server.NewHTTPServer(mux, "app", "1.0.0", server.HTTPServerConfig{
     Admin:        &server.AdminConfig{AppName: "app", AppVersion: "1.0.0", Store: store},
     AuditConfig:  &server.HTTPAuditConfig{Enabled: true, Methods: []string{"POST", "PUT", "DELETE"}},
     LogRequestBodyOnErrors: false, // opt in only for payloads safe to persist in logs
+    LogLevels:    map[int]logger.LogLevel{http.StatusUnauthorized: logger.Info}, // per-status access-log levels
     OTelBridge:   &server.OTelBridgeConfig{ServiceName: "app", ServiceVersion: "1.0.0"},
     MetricsServerConfig: &server.MetricsServerConfig{Handler: promHandler},
     BaseContext:  func(net.Listener) context.Context { return baseCtx },
@@ -190,6 +191,7 @@ srv, err := server.NewHTTPServer(mux, "app", "1.0.0", server.HTTPServerConfig{
 | `MetricsServerConfig`    | `*MetricsServerConfig`                            | nil                    | Embedded metrics sidecar (e.g. Prometheus)                             |
 | `AuditConfig`            | `*HTTPAuditConfig`                                | nil                    | Structured audit logging per request                                   |
 | `LogRequestBodyOnErrors` | `bool`                                            | false                  | Buffer and log request bodies for 4xx/5xx responses                    |
+| `LogLevels`              | `map[int]logger.LogLevel`                         | nil (logger defaults)  | Per-status access-log level overrides; exact key beats class key       |
 | `OTelBridge`             | `*OTelBridgeConfig`                               | nil                    | OpenTelemetry log bridge (service.name + level mapping)                |
 | `RateLimitConfig`        | `*HTTPRateLimitConfig`                            | nil                    | Per-client token-bucket rate limiting                                  |
 | `CORS`                   | `*CORSConfig`                                     | nil (disabled)         | Cross-Origin Resource Sharing headers                                  |
@@ -213,6 +215,23 @@ srv, err := server.NewHTTPServer(mux, "app", "1.0.0", server.HTTPServerConfig{
 > including on the final dotted segment. Bodies larger than the logger
 > `MaxBodySize` are still logged as a raw truncated string without key-level
 > redaction.
+
+**Access-log levels** default to `5xx → Error`, `4xx → Warn`, everything else
+`Info`. `LogLevels` overrides this per status code — keys may be an exact
+status (`401`) or a status class (`400` for all 4xx), with exact winning over
+class:
+
+```go
+srv, _ := server.NewHTTPServer(mux, "auth", "1.0.0", server.HTTPServerConfig{
+    LogLevels: map[int]logger.LogLevel{
+        http.StatusUnauthorized: logger.Info, // routine probe outcome, not an anomaly
+    },
+})
+```
+
+The map is copied at construction; mutating it afterwards has no effect.
+Requires importing `github.com/jozefvalachovic/logger/v4` for the
+`logger.LogLevel` type.
 
 **`HTTPAuditConfig`** — controls structured audit event emission:
 

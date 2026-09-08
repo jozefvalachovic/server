@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -128,6 +129,153 @@ func TestHTTPServerAuditSkipPathsMergeWithDefaults(t *testing.T) {
 	}
 }
 
+func TestHTTPServerLogLevelsExactOverride(t *testing.T) {
+	// Consumer intent: routine 401 probes on an auth service log at Info
+	// instead of the 4xx Warn default.
+	server := newHTTPLogLevelsTestServer(t, map[int]logger.LogLevel{
+		http.StatusUnauthorized: logger.Info,
+	})
+	logs := captureHTTPLogs(t)
+
+	serveLogLevelsRequest(server, "/unauthorized")
+
+	line := findAccessLogLine(logs.String(), "/unauthorized")
+	if line == "" {
+		t.Fatal("401 request was not access-logged")
+	}
+	if !strings.Contains(line, " INFO ") {
+		t.Fatalf("401 logged at wrong level; want INFO, got line: %s", line)
+	}
+}
+
+func TestHTTPServerLogLevelsDefaultWarnFor401(t *testing.T) {
+	// Without LogLevels the logger default applies: 4xx → Warn.
+	server := newHTTPLogLevelsTestServer(t, nil)
+	logs := captureHTTPLogs(t)
+
+	serveLogLevelsRequest(server, "/unauthorized")
+
+	line := findAccessLogLine(logs.String(), "/unauthorized")
+	if line == "" {
+		t.Fatal("401 request was not access-logged")
+	}
+	if !strings.Contains(line, " WARN ") {
+		t.Fatalf("401 default level changed; want WARN, got line: %s", line)
+	}
+}
+
+func TestHTTPServerLogLevelsClassKeyAppliesToClass(t *testing.T) {
+	// Class key 400 covers every 4xx, so a 404 logs at the class level.
+	server := newHTTPLogLevelsTestServer(t, map[int]logger.LogLevel{
+		400: logger.Info,
+	})
+	logs := captureHTTPLogs(t)
+
+	serveLogLevelsRequest(server, "/missing")
+
+	line := findAccessLogLine(logs.String(), "/missing")
+	if line == "" {
+		t.Fatal("404 request was not access-logged")
+	}
+	if !strings.Contains(line, " INFO ") {
+		t.Fatalf("class key 400 did not apply to 404; want INFO, got line: %s", line)
+	}
+}
+
+func TestHTTPServerLogLevelsExactBeatsClass(t *testing.T) {
+	// Exact key 404 must win over class key 400.
+	server := newHTTPLogLevelsTestServer(t, map[int]logger.LogLevel{
+		400:                 logger.Info,
+		http.StatusNotFound: logger.Error,
+	})
+	logs := captureHTTPLogs(t)
+
+	serveLogLevelsRequest(server, "/missing")
+	serveLogLevelsRequest(server, "/unauthorized")
+
+	notFound := findAccessLogLine(logs.String(), "/missing")
+	if !strings.Contains(notFound, " ERROR ") {
+		t.Fatalf("exact key 404 did not beat class key 400; want ERROR, got line: %s", notFound)
+	}
+	// 401 has no exact key, so the class key still applies.
+	unauthorized := findAccessLogLine(logs.String(), "/unauthorized")
+	if !strings.Contains(unauthorized, " INFO ") {
+		t.Fatalf("class key 400 did not apply to 401; want INFO, got line: %s", unauthorized)
+	}
+}
+
+func TestHTTPServerLogLevelsMapCopiedAtConstruction(t *testing.T) {
+	// WithLogLevels assigns the map by reference; NewHTTPServer must clone it
+	// so later caller mutation cannot change logging at runtime.
+	levels := map[int]logger.LogLevel{http.StatusUnauthorized: logger.Info}
+	server := newHTTPLogLevelsTestServer(t, levels)
+	levels[http.StatusUnauthorized] = logger.Error // mutate after construction
+
+	logs := captureHTTPLogs(t)
+	serveLogLevelsRequest(server, "/unauthorized")
+
+	line := findAccessLogLine(logs.String(), "/unauthorized")
+	if !strings.Contains(line, " INFO ") {
+		t.Fatalf("caller map mutation leaked into logging; want INFO, got line: %s", line)
+	}
+}
+
+func TestHTTPServerConfigValidateRejectsInvalidLogLevelKeys(t *testing.T) {
+	cfg := HTTPServerConfig{LogLevels: map[int]logger.LogLevel{99: logger.Info}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate accepted LogLevels key 99; want error")
+	}
+	cfg = HTTPServerConfig{LogLevels: map[int]logger.LogLevel{600: logger.Info}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate accepted LogLevels key 600; want error")
+	}
+	cfg = HTTPServerConfig{LogLevels: map[int]logger.LogLevel{
+		http.StatusUnauthorized: logger.Info,
+		400:                     logger.Warn,
+	}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate rejected valid LogLevels: %v", err)
+	}
+}
+
+func newHTTPLogLevelsTestServer(t *testing.T, levels map[int]logger.LogLevel) *HTTPServer {
+	t.Helper()
+	t.Setenv("HTTP_HOST", "127.0.0.1")
+	t.Setenv("HTTP_PORT", "8080")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /unauthorized", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	mux.HandleFunc("GET /missing", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	server, err := NewHTTPServer(mux, "logging-test", "1.0.0", HTTPServerConfig{
+		LogLevels: levels,
+	})
+	if err != nil {
+		t.Fatalf("NewHTTPServer: %v", err)
+	}
+	return server
+}
+
+func serveLogLevelsRequest(server *HTTPServer, path string) {
+	request := httptest.NewRequest(http.MethodGet, path, nil)
+	server.server.Handler.ServeHTTP(httptest.NewRecorder(), request)
+}
+
+// findAccessLogLine returns the log line containing the access-log entry for
+// path, or "" when absent. The pretty format is "time LEVEL message json".
+func findAccessLogLine(output, path string) string {
+	for _, line := range strings.Split(output, "\n") {
+		if strings.Contains(line, `"__path":"`+path+`"`) {
+			return line
+		}
+	}
+	return ""
+}
+
 func newHTTPLoggingTestServer(t *testing.T, enabled bool, received *string) (*HTTPServer, *string) {
 	t.Helper()
 	t.Setenv("HTTP_HOST", "127.0.0.1")
@@ -167,6 +315,8 @@ func captureHTTPLogs(t *testing.T) *bytes.Buffer {
 	configured.EnableDedup = false
 	configured.SampleRate = 1
 	configured.SampleRateSet = true
+	configured.Level = slog.LevelDebug
+	configured.LevelSet = true
 	logger.SetConfig(configured)
 	t.Cleanup(func() { logger.SetConfig(previous) })
 	return &output

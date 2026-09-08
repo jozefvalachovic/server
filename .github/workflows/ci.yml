@@ -222,7 +222,7 @@ jobs:
               gh release create "$TAG" \
                 --title "Release $TAG" \
                 --generate-notes \
-                --notes "Default health-probe skip paths (/health, /healthcheck, /ready, /livez, /live) are now actually suppressed from access logs; previously a duplicate WithSkipPaths call silently dropped them. Upgraded to logger/v4 v4.3.0: JSON request-body fields (body.<field>) are now redacted by RedactKeys, and redaction applies to all log destinations including the OTel bridge."
+                --notes "New HTTPServerConfig.LogLevels map overrides the access-log level per HTTP status code (exact key beats class key, e.g. 400 for all 4xx). Purely additive: unset statuses keep the logger defaults (5xx Error, 4xx Warn, otherwise Info). The map is copied at construction and keys are validated to 100-599."
             else
               gh release create "$TAG" \
                 --title "Release $TAG" \
