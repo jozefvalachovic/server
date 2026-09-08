@@ -207,14 +207,25 @@ srv, err := server.NewHTTPServer(mux, "app", "1.0.0", server.HTTPServerConfig{
 > `HTTPServerConfig.LogRequestBodyOnErrors`. Workloads that relied on
 > failed-request body logging must set it to `true`. Leave it disabled for
 > requests that may contain personal data, credentials, or model prompts.
+>
+> With logger v4.3.0+, JSON body fields logged as `body.<field>` are redacted
+> when the field name matches `RedactKeys` (e.g. `body.password` → `***`),
+> including on the final dotted segment. Bodies larger than the logger
+> `MaxBodySize` are still logged as a raw truncated string without key-level
+> redaction.
 
 **`HTTPAuditConfig`** — controls structured audit event emission:
 
-| Field       | Type       | Default     | Description                                  |
-| ----------- | ---------- | ----------- | -------------------------------------------- |
-| `Enabled`   | `bool`     | false       | Activates per-request audit events           |
-| `Methods`   | `[]string` | all methods | Restrict auditing to specific HTTP methods   |
-| `SkipPaths` | `[]string` | none        | Paths excluded from access logging and audit |
+| Field       | Type       | Default     | Description                                                    |
+| ----------- | ---------- | ----------- | -------------------------------------------------------------- |
+| `Enabled`   | `bool`     | false       | Activates per-request audit events                             |
+| `Methods`   | `[]string` | all methods | Restrict auditing to specific HTTP methods                     |
+| `SkipPaths` | `[]string` | none        | Extra paths excluded from access logging and audit (see below) |
+
+> Health-probe paths `/health`, `/healthcheck`, `/healthz`, `/readyz`, `/ready`,
+> `/livez`, and `/live` are **always** excluded from access logging and audit to
+> suppress high-frequency probe noise. `AuditConfig.SkipPaths` is merged into
+> that list (duplicates removed), not used instead of it.
 
 | Environment variable | Required | Description                               |
 | -------------------- | -------- | ----------------------------------------- |
@@ -1188,20 +1199,20 @@ Streamable HTTP is stateless and uses JSON responses. Clients send one POST per
 request with per-request protocol metadata; no session ID is issued, while GET
 and DELETE return 405. Request cancellation is propagated to tool contexts.
 
-| `Config` field        | Default     | Description                                                           |
-| --------------------- | ----------- | --------------------------------------------------------------------- |
-| `Name`, `Version`     | required    | Server identity returned by discovery                                 |
-| `Instructions`        | empty       | Instructions advertised to clients                                    |
-| `Logger`              | SDK default | `*slog.Logger` used by the official SDK                               |
-| `AllowedOrigins`      | same-origin | Browser origins allowed by the built-in Origin policy; `*` allows any |
-| `Authenticate`        | disabled    | Authenticates HTTP requests and may return a derived context          |
-| `MaxRequestBodyBytes` | 1 MiB       | Maximum Streamable HTTP request body                                  |
-| `RequestTimeout`      | 30 s        | Deadline propagated through each HTTP request                         |
-| `MaxConcurrent`       | 64          | Process-local concurrent HTTP request limit                           |
-| `RateLimit`           | disabled    | Optional process-local token bucket                                   |
-| `Middleware`          | none        | Official SDK receiving middleware                                     |
-| `Hooks`               | none        | MCP method start/finish hooks for metrics and tracing                 |
-| `Audit`               | none        | HTTP completion hook, including policy rejections                     |
+| `Config` field        | Default     | Description                                                                                                                                 |
+| --------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Name`, `Version`     | required    | Server identity returned by discovery                                                                                                       |
+| `Instructions`        | empty       | Instructions advertised to clients                                                                                                          |
+| `Logger`              | SDK default | `*slog.Logger` used by the official SDK; pass `logger.Slog()` (logger v4.3.0+) to route SDK logs through the shared pipeline with redaction |
+| `AllowedOrigins`      | same-origin | Browser origins allowed by the built-in Origin policy; `*` allows any                                                                       |
+| `Authenticate`        | disabled    | Authenticates HTTP requests and may return a derived context                                                                                |
+| `MaxRequestBodyBytes` | 1 MiB       | Maximum Streamable HTTP request body                                                                                                        |
+| `RequestTimeout`      | 30 s        | Deadline propagated through each HTTP request                                                                                               |
+| `MaxConcurrent`       | 64          | Process-local concurrent HTTP request limit                                                                                                 |
+| `RateLimit`           | disabled    | Optional process-local token bucket                                                                                                         |
+| `Middleware`          | none        | Official SDK receiving middleware                                                                                                           |
+| `Hooks`               | none        | MCP method start/finish hooks for metrics and tracing                                                                                       |
+| `Audit`               | none        | HTTP completion hook, including policy rejections                                                                                           |
 
 Do not stack a second CORS implementation around the MCP handler. Requests
 without an `Origin` header, including typical server-to-server clients, are

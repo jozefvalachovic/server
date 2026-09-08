@@ -87,7 +87,11 @@ type Config struct {
 	Name         string
 	Version      string
 	Instructions string
-	Logger       *slog.Logger
+	// Logger receives SDK diagnostics. When the process also uses
+	// github.com/jozefvalachovic/logger v4.3.0+, passing logger.Slog()
+	// routes SDK logs through the shared pipeline (level, output,
+	// redaction, AdditionalHandlers).
+	Logger *slog.Logger
 
 	AllowedOrigins      []string
 	Authenticate        Authenticator

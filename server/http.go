@@ -242,8 +242,11 @@ type HTTPServerConfig struct {
 
 	// LogRequestBodyOnErrors buffers request bodies and writes them to the access
 	// log when a request fails with 4xx/5xx. Off by default: bodies may carry
-	// personal data or model prompts that must not reach logs. Bodies larger than
-	// logger MaxBodySize are logged without key-level redaction.
+	// personal data or model prompts that must not reach logs. JSON body fields
+	// are logged as "body.<field>" keys and sensitive fields (password, token,
+	// secret, …) are redacted by the logger. Bodies larger than logger
+	// MaxBodySize are logged as a raw truncated string without key-level
+	// redaction.
 	LogRequestBodyOnErrors bool
 
 	// MetricsServerConfig starts an embedded metrics server (e.g. Prometheus).
@@ -541,11 +544,6 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 		loggerMiddleware.WithLogBodyOnErrors(cfg.LogRequestBodyOnErrors),
 		loggerMiddleware.WithRequestID(true),
 		loggerMiddleware.WithMetrics(true),
-		// Skip common health check paths from logging.
-		loggerMiddleware.WithSkipPaths(
-			"/health", "/healthcheck", // Common health check paths
-			"/healthz", "/readyz", "/ready", "/livez", "/live", // Kubernetes check paths
-		),
 	}
 
 	// Inject app identity into every access log entry when known.
@@ -561,8 +559,12 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 	}
 
 	// Always suppress noisy health-probe paths from access logs.
-	// User-provided SkipPaths from AuditConfig are merged in.
-	skipPaths := []string{"/healthz", "/readyz"}
+	// WithSkipPaths replaces (not appends) the list, so all defaults and
+	// user-provided SkipPaths from AuditConfig are merged into one slice.
+	skipPaths := []string{
+		"/health", "/healthcheck", // Common health check paths
+		"/healthz", "/readyz", "/ready", "/livez", "/live", // Kubernetes check paths
+	}
 
 	if cfg.AuditConfig != nil {
 		if cfg.AuditConfig.Enabled {
@@ -573,7 +575,10 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 		}
 		skipPaths = append(skipPaths, cfg.AuditConfig.SkipPaths...)
 	}
-	logOpts = append(logOpts, loggerMiddleware.WithSkipPaths(skipPaths...))
+	// Exact-match list — order is irrelevant, so sort+compact to dedupe
+	// user entries that overlap the defaults (e.g. "/healthz").
+	slices.Sort(skipPaths)
+	logOpts = append(logOpts, loggerMiddleware.WithSkipPaths(slices.Compact(skipPaths)...))
 
 	handler = loggerMiddleware.LogHTTPMiddleware(handler, logOpts...)
 

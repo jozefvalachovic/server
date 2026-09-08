@@ -222,7 +222,7 @@ jobs:
               gh release create "$TAG" \
                 --title "Release $TAG" \
                 --generate-notes \
-                --notes "Request-body logging on 4xx/5xx is now opt-in via HTTPServerConfig.LogRequestBodyOnErrors. Workloads that relied on failed-request body logging must set it to true."
+                --notes "Default health-probe skip paths (/health, /healthcheck, /ready, /livez, /live) are now actually suppressed from access logs; previously a duplicate WithSkipPaths call silently dropped them. Upgraded to logger/v4 v4.3.0: JSON request-body fields (body.<field>) are now redacted by RedactKeys, and redaction applies to all log destinations including the OTel bridge."
             else
               gh release create "$TAG" \
                 --title "Release $TAG" \
