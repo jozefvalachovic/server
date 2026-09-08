@@ -268,7 +268,7 @@ func serveLogLevelsRequest(server *HTTPServer, path string) {
 // findAccessLogLine returns the log line containing the access-log entry for
 // path, or "" when absent. The pretty format is "time LEVEL message json".
 func findAccessLogLine(output, path string) string {
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		if strings.Contains(line, `"__path":"`+path+`"`) {
 			return line
 		}
