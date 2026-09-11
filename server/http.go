@@ -58,25 +58,46 @@ type OTelBridgeConfig struct {
 //   - shutdownLoggerOnce ensures logger buffers are drained exactly once
 //     during the first GracefulShutdown/ForceShutdown call.
 var (
-	initLoggerOnce sync.Once
-	initLoggerOTel *OTelBridgeConfig // first OTel config; used to detect conflicts
+	initLoggerOnce        sync.Once
+	initLoggerOTel        *OTelBridgeConfig // first OTel config; used to detect conflicts
+	initLoggerRedactPaths []string          // first RedactPaths; used to detect conflicts
 )
 
-func initLogger(otel *OTelBridgeConfig) {
+// buildLoggerConfig assembles the process-wide logger configuration from the
+// environment plus the server-supplied overrides. Split out from initLogger so
+// the merge semantics are testable without resetting initLoggerOnce.
+func buildLoggerConfig(otel *OTelBridgeConfig, redactPaths []string) logger.Config {
+	cfg := logger.ConfigFromEnv()
+	cfg.EnableDedup = true
+	cfg.EnableMetrics = true
+	if otel != nil {
+		inner := otel.Handler
+		if inner == nil {
+			inner = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
+		}
+		bridge := logger.NewOTelBridgeHandler(inner, otel.ServiceName, otel.ServiceVersion)
+		cfg.AdditionalHandlers = append(cfg.AdditionalHandlers, bridge)
+	}
+	// RedactPaths must be applied here rather than by the caller beforehand:
+	// ConfigFromEnv starts from the package defaults (empty RedactPaths) and the
+	// SetConfig in initLogger replaces the global config, so any paths a caller
+	// set via logger.SetConfig before constructing a server would be dropped.
+	// The logging middleware also snapshots the config during construction, so
+	// this is the only point where the paths still reach access-log redaction.
+	// slices.Concat copies the values and always allocates, so neither later
+	// mutation of the caller's slice nor the package-default backing array can
+	// affect redaction.
+	if len(redactPaths) > 0 {
+		cfg.RedactPaths = slices.Concat(cfg.RedactPaths, redactPaths)
+	}
+	return cfg
+}
+
+func initLogger(otel *OTelBridgeConfig, redactPaths []string) {
 	initLoggerOnce.Do(func() {
 		initLoggerOTel = otel
-		cfg := logger.ConfigFromEnv()
-		cfg.EnableDedup = true
-		cfg.EnableMetrics = true
-		if otel != nil {
-			inner := otel.Handler
-			if inner == nil {
-				inner = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
-			}
-			bridge := logger.NewOTelBridgeHandler(inner, otel.ServiceName, otel.ServiceVersion)
-			cfg.AdditionalHandlers = append(cfg.AdditionalHandlers, bridge)
-		}
-		logger.SetConfig(cfg)
+		initLoggerRedactPaths = slices.Clone(redactPaths)
+		logger.SetConfig(buildLoggerConfig(otel, redactPaths))
 	})
 
 	// Detect conflicting OTel configurations on subsequent calls.
@@ -90,6 +111,25 @@ func initLogger(otel *OTelBridgeConfig) {
 	case (otel == nil) != (initLoggerOTel == nil):
 		logger.LogWarn("initLogger: OTelBridgeConfig presence differs from first initialization; first-caller config is used")
 	}
+
+	// Detect RedactPaths that the first initialization did not cover. Silently
+	// ignoring them would leave sensitive URLs (e.g. OAuth callbacks carrying
+	// ?code=) in the access log, so make the gap loud instead.
+	if missing := missingRedactPaths(redactPaths, initLoggerRedactPaths); len(missing) > 0 {
+		logger.LogWarn("initLogger called with RedactPaths absent from first initialization; first-caller config is used and these paths are NOT redacted",
+			"missing", missing, "firstRedactPaths", initLoggerRedactPaths)
+	}
+}
+
+// missingRedactPaths returns the entries of want that are absent from have.
+func missingRedactPaths(want, have []string) []string {
+	var missing []string
+	for _, p := range want {
+		if !slices.Contains(have, p) {
+			missing = append(missing, p)
+		}
+	}
+	return missing
 }
 
 // shutdownLoggerOnce ensures logger.Shutdown is called exactly once per
@@ -262,6 +302,23 @@ type HTTPServerConfig struct {
 	//		http.StatusUnauthorized: logger.Info,
 	//	}
 	LogLevels map[int]logger.LogLevel
+
+	// RedactPaths lists URL paths whose full request line is masked in access
+	// logs (replaced by the logger RedactMask). Use it for endpoints that carry
+	// secrets in the query string, e.g. OAuth callbacks receiving ?code=…:
+	//
+	//	RedactPaths: []string{"/oauth/google/callback", "/oauth/microsoft/callback"}
+	//
+	// Matching is substring-based against the path including the query string.
+	// These paths are still served and still counted in metrics; only the logged
+	// path is masked.
+	//
+	// The logger is initialised once per process by the first server
+	// constructed, so in a multi-server process only the first server's
+	// RedactPaths take effect (a later server supplying uncovered paths logs a
+	// warning). Configure them here rather than via logger.SetConfig before
+	// construction — that earlier config is replaced during initialisation.
+	RedactPaths []string
 
 	// MetricsServerConfig starts an embedded metrics server (e.g. Prometheus).
 	// nil disables the metrics server.
@@ -451,7 +508,7 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 		return nil, fmt.Errorf("invalid HTTPServerConfig: %w", err)
 	}
 
-	initLogger(cfg.OTelBridge)
+	initLogger(cfg.OTelBridge, cfg.RedactPaths)
 	log := logger.With("component", "http")
 
 	port := os.Getenv("HTTP_PORT")

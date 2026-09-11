@@ -168,6 +168,7 @@ srv, err := server.NewHTTPServer(mux, "app", "1.0.0", server.HTTPServerConfig{
     AuditConfig:  &server.HTTPAuditConfig{Enabled: true, Methods: []string{"POST", "PUT", "DELETE"}},
     LogRequestBodyOnErrors: false, // opt in only for payloads safe to persist in logs
     LogLevels:    map[int]logger.LogLevel{http.StatusUnauthorized: logger.Info}, // per-status access-log levels
+    RedactPaths:   []string{"/oauth/google/callback"}, // mask URLs carrying secrets in the query string
     OTelBridge:   &server.OTelBridgeConfig{ServiceName: "app", ServiceVersion: "1.0.0"},
     MetricsServerConfig: &server.MetricsServerConfig{Handler: promHandler},
     BaseContext:  func(net.Listener) context.Context { return baseCtx },
@@ -192,6 +193,7 @@ srv, err := server.NewHTTPServer(mux, "app", "1.0.0", server.HTTPServerConfig{
 | `AuditConfig`            | `*HTTPAuditConfig`                                | nil                    | Structured audit logging per request                                   |
 | `LogRequestBodyOnErrors` | `bool`                                            | false                  | Buffer and log request bodies for 4xx/5xx responses                    |
 | `LogLevels`              | `map[int]logger.LogLevel`                         | nil (logger defaults)  | Per-status access-log level overrides; exact key beats class key       |
+| `RedactPaths`            | `[]string`                                        | none                   | URL paths masked in access logs (e.g. OAuth callbacks with `?code=`)   |
 | `OTelBridge`             | `*OTelBridgeConfig`                               | nil                    | OpenTelemetry log bridge (service.name + level mapping)                |
 | `RateLimitConfig`        | `*HTTPRateLimitConfig`                            | nil                    | Per-client token-bucket rate limiting                                  |
 | `CORS`                   | `*CORSConfig`                                     | nil (disabled)         | Cross-Origin Resource Sharing headers                                  |
@@ -232,6 +234,34 @@ srv, _ := server.NewHTTPServer(mux, "auth", "1.0.0", server.HTTPServerConfig{
 The map is copied at construction; mutating it afterwards has no effect.
 Requires importing `github.com/jozefvalachovic/logger/v4` for the
 `logger.LogLevel` type.
+
+**Redacting sensitive URLs.** The access log records the full request line
+including the query string, so endpoints that receive secrets in the URL —
+OAuth callbacks handed `?code=…`, magic-link tokens, signed URLs — leak them
+into logs. List those paths in `RedactPaths` and the logged path is replaced by
+the logger `RedactMask` (`***` by default):
+
+```go
+srv, _ := server.NewHTTPServer(mux, "auth", "1.0.0", server.HTTPServerConfig{
+    RedactPaths: []string{
+        "/oauth/google/callback",
+        "/oauth/microsoft/callback",
+    },
+})
+```
+
+Matching is substring-based against the path including the query string. The
+routes are still served and still counted in metrics; only the logged path is
+masked.
+
+> Configure `RedactPaths` through `HTTPServerConfig`, **not** by calling
+> `logger.SetConfig` before `NewHTTPServer`. The logger is initialised once per
+> process during server construction, and that initialisation replaces the
+> global config — paths set beforehand are discarded. The logging middleware
+> also snapshots the config at construction time, so setting them afterwards
+> has no effect either. In a multi-server process only the first server's
+> `RedactPaths` apply; a later server supplying uncovered paths logs a warning
+> naming them.
 
 **`HTTPAuditConfig`** — controls structured audit event emission:
 

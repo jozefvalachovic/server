@@ -134,7 +134,9 @@ func NewTCPServer(handler func(conn net.Conn), appName, appVersion string, cfg T
 		return nil, fmt.Errorf("invalid TCPServerConfig: %w", err)
 	}
 
-	initLogger(cfg.OTelBridge)
+	// TCP connections carry no URL paths, so there is nothing to redact here.
+	// RedactPaths is an HTTP-only concern (see HTTPServerConfig.RedactPaths).
+	initLogger(cfg.OTelBridge, nil)
 	log := logger.With("component", "tcp")
 
 	var (

@@ -222,7 +222,7 @@ jobs:
               gh release create "$TAG" \
                 --title "Release $TAG" \
                 --generate-notes \
-                --notes "New HTTPServerConfig.LogLevels map overrides the access-log level per HTTP status code (exact key beats class key, e.g. 400 for all 4xx). Purely additive: unset statuses keep the logger defaults (5xx Error, 4xx Warn, otherwise Info). The map is copied at construction and keys are validated to 100-599."
+                --notes "New HTTPServerConfig.RedactPaths masks sensitive URLs (e.g. OAuth callbacks carrying ?code=) in access logs. Configure paths here rather than via logger.SetConfig before NewHTTPServer: logger initialisation replaces the global config, so paths set beforehand were silently discarded and the authorization code reached the access log. Purely additive; no behaviour change when unset."
             else
               gh release create "$TAG" \
                 --title "Release $TAG" \
