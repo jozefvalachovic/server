@@ -169,6 +169,7 @@ srv, err := server.NewHTTPServer(mux, "app", "1.0.0", server.HTTPServerConfig{
     LogRequestBodyOnErrors: false, // opt in only for payloads safe to persist in logs
     LogLevels:    map[int]logger.LogLevel{http.StatusUnauthorized: logger.Info}, // per-status access-log levels
     RedactPaths:   []string{"/oauth/google/callback"}, // mask URLs carrying secrets in the query string
+    ErrorLog:      logger.StdLogger(slog.LevelError), // net/http internal errors via the logger pipeline
     OTelBridge:   &server.OTelBridgeConfig{ServiceName: "app", ServiceVersion: "1.0.0"},
     MetricsServerConfig: &server.MetricsServerConfig{Handler: promHandler},
     BaseContext:  func(net.Listener) context.Context { return baseCtx },
@@ -194,6 +195,7 @@ srv, err := server.NewHTTPServer(mux, "app", "1.0.0", server.HTTPServerConfig{
 | `LogRequestBodyOnErrors` | `bool`                                            | false                  | Buffer and log request bodies for 4xx/5xx responses                    |
 | `LogLevels`              | `map[int]logger.LogLevel`                         | nil (logger defaults)  | Per-status access-log level overrides; exact key beats class key       |
 | `RedactPaths`            | `[]string`                                        | none                   | URL paths masked in access logs (e.g. OAuth callbacks with `?code=`)   |
+| `ErrorLog`               | `*log.Logger`                                     | nil (std `log`)        | Destination for net/http internal errors (`http.Server.ErrorLog`)      |
 | `OTelBridge`             | `*OTelBridgeConfig`                               | nil                    | OpenTelemetry log bridge (service.name + level mapping)                |
 | `RateLimitConfig`        | `*HTTPRateLimitConfig`                            | nil                    | Per-client token-bucket rate limiting                                  |
 | `CORS`                   | `*CORSConfig`                                     | nil (disabled)         | Cross-Origin Resource Sharing headers                                  |
@@ -262,6 +264,21 @@ masked.
 > has no effect either. In a multi-server process only the first server's
 > `RedactPaths` apply; a later server supplying uncovered paths logs a warning
 > naming them.
+
+**net/http internal errors** (TLS handshake failures, accept errors,
+superfluous `WriteHeader` calls) bypass the access log and go to
+`http.Server.ErrorLog`, which defaults to the standard `log` package as
+unstructured stderr lines. Route them through the logger pipeline (level,
+output, redaction, `AdditionalHandlers`) with logger v4.4.0+:
+
+```go
+srv, _ := server.NewHTTPServer(mux, "app", "1.0.0", server.HTTPServerConfig{
+    ErrorLog: logger.StdLogger(slog.LevelError),
+})
+```
+
+As with `logger.Slog()`, sampling, deduplication, and async buffering do not
+apply to this path.
 
 **`HTTPAuditConfig`** — controls structured audit event emission:
 

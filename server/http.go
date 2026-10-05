@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"maps"
 	"net"
@@ -319,6 +320,11 @@ type HTTPServerConfig struct {
 	// warning). Configure them here rather than via logger.SetConfig before
 	// construction — that earlier config is replaced during initialisation.
 	RedactPaths []string
+
+	// ErrorLog receives net/http internal errors (TLS handshakes, accept failures,
+	// superfluous WriteHeader). nil uses the standard log package; pass
+	// logger.StdLogger(slog.LevelError) to route them through the logger pipeline.
+	ErrorLog *log.Logger
 
 	// MetricsServerConfig starts an embedded metrics server (e.g. Prometheus).
 	// nil disables the metrics server.
@@ -701,6 +707,7 @@ func NewHTTPServer(mux *http.ServeMux, appName, appVersion string, cfg HTTPServe
 		MaxHeaderValueCount: cfg.MaxHeaderValueCount,
 		ReadTimeout:         readTimeout,
 		WriteTimeout:        writeTimeout,
+		ErrorLog:            cfg.ErrorLog,
 	}
 
 	// Wire optional BaseContext / ConnContext hooks so callers can inject

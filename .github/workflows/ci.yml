@@ -222,7 +222,7 @@ jobs:
               gh release create "$TAG" \
                 --title "Release $TAG" \
                 --generate-notes \
-                --notes "New HTTPServerConfig.RedactPaths masks sensitive URLs (e.g. OAuth callbacks carrying ?code=) in access logs. Configure paths here rather than via logger.SetConfig before NewHTTPServer: logger initialisation replaces the global config, so paths set beforehand were silently discarded and the authorization code reached the access log. Purely additive; no behaviour change when unset."
+                --notes "New HTTPServerConfig.ErrorLog is passed to http.Server.ErrorLog, so net/http internal errors (TLS handshakes, accept failures, superfluous WriteHeader) can be routed through the logger pipeline with logger.StdLogger(slog.LevelError). Requires logger/v4 v4.4.0. Purely additive; nil keeps the standard log package default."
             else
               gh release create "$TAG" \
                 --title "Release $TAG" \

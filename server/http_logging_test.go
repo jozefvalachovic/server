@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"io"
+	"log"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -274,6 +275,52 @@ func findAccessLogLine(output, path string) string {
 		}
 	}
 	return ""
+}
+
+func TestHTTPServerErrorLogDefaultNil(t *testing.T) {
+	server := newErrorLogTestServer(t, nil)
+
+	if server.server.ErrorLog != nil {
+		t.Fatal("ErrorLog set without configuration; want nil (net/http default)")
+	}
+}
+
+func TestHTTPServerErrorLogPassedThrough(t *testing.T) {
+	errorLog := log.New(io.Discard, "", 0)
+	server := newErrorLogTestServer(t, errorLog)
+
+	if server.server.ErrorLog != errorLog {
+		t.Fatal("HTTPServerConfig.ErrorLog was not passed to http.Server.ErrorLog")
+	}
+}
+
+func TestHTTPServerErrorLogRoutesThroughLoggerPipeline(t *testing.T) {
+	server := newErrorLogTestServer(t, logger.StdLogger(slog.LevelError))
+	logs := captureHTTPLogs(t)
+
+	server.server.ErrorLog.Print("http: TLS handshake error from 10.0.0.1:1234: EOF")
+
+	output := logs.String()
+	if !strings.Contains(output, "TLS handshake error") {
+		t.Fatalf("net/http error line did not reach the logger pipeline:\n%s", output)
+	}
+	if !strings.Contains(output, " ERROR ") {
+		t.Fatalf("net/http error line not logged at ERROR:\n%s", output)
+	}
+}
+
+func newErrorLogTestServer(t *testing.T, errorLog *log.Logger) *HTTPServer {
+	t.Helper()
+	t.Setenv("HTTP_HOST", "127.0.0.1")
+	t.Setenv("HTTP_PORT", "8080")
+
+	server, err := NewHTTPServer(http.NewServeMux(), "logging-test", "1.0.0", HTTPServerConfig{
+		ErrorLog: errorLog,
+	})
+	if err != nil {
+		t.Fatalf("NewHTTPServer: %v", err)
+	}
+	return server
 }
 
 func newHTTPLoggingTestServer(t *testing.T, enabled bool, received *string) (*HTTPServer, *string) {
